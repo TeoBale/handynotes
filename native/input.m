@@ -1,0 +1,116 @@
+#import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h>
+#import <math.h>
+#import <pthread.h>
+#import <stdint.h>
+
+enum {
+    InputToggle = 1,
+    InputSwipeLeft = 2,
+    InputSwipeRight = 3,
+};
+
+static void (*deliverEvent)(int32_t);
+
+static const EventHotKeyID toggleID = {.signature = 0x484E5445, .id = 1}; // HNTE
+static BOOL hotKeyHeld;
+
+static OSStatus handleHotKey(EventHandlerCallRef next, EventRef event, void *context) {
+    (void)next;
+    (void)context;
+
+    EventHotKeyID key;
+    OSStatus result = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+                                        NULL, sizeof(key), NULL, &key);
+    if (result != noErr || key.signature != toggleID.signature || key.id != toggleID.id) {
+        return eventNotHandledErr;
+    }
+
+    if (GetEventKind(event) == kEventHotKeyReleased) {
+        hotKeyHeld = NO;
+    } else if (!hotKeyHeld) {
+        hotKeyHeld = YES;
+        deliverEvent(InputToggle);
+    }
+    return noErr;
+}
+
+static void installSwipeMonitor(void) {
+    static id monitor;
+    if (monitor != nil) {
+        return;
+    }
+
+    __block BOOL tracking = NO;
+    __block BOOL handled = NO;
+    __block CGFloat horizontal = 0;
+    __block CGFloat verticalTravel = 0;
+
+    monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel
+        handler:^NSEvent *(NSEvent *event) {
+            if (!event.hasPreciseScrollingDeltas || event.momentumPhase != NSEventPhaseNone) {
+                return event;
+            }
+
+            NSEventPhase phase = event.phase;
+            if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+                tracking = NO;
+                return event;
+            }
+            if (phase & NSEventPhaseBegan) {
+                tracking = event.window != nil && event.window == NSApp.keyWindow;
+                handled = NO;
+                horizontal = 0;
+                verticalTravel = 0;
+            }
+
+            if (!tracking || event.window == nil || event.window != NSApp.keyWindow) {
+                tracking = NO;
+                return event;
+            }
+            if (handled) {
+                return event;
+            }
+
+            if (phase & (NSEventPhaseBegan | NSEventPhaseChanged)) {
+                // Normalize to the physical direction regardless of the scroll preference.
+                CGFloat delta = event.scrollingDeltaX;
+                horizontal += event.isDirectionInvertedFromDevice ? -delta : delta;
+                verticalTravel += fabs(event.scrollingDeltaY);
+                if (fabs(horizontal) >= 38 && fabs(horizontal) > 1.6 * verticalTravel) {
+                    handled = YES;
+                    deliverEvent(horizontal > 0 ? InputSwipeLeft : InputSwipeRight);
+                }
+            }
+            return event;
+        }];
+}
+
+int32_t handynotes_input_install(void (*deliver)(int32_t)) {
+    static EventHotKeyRef hotKey;
+    static EventHandlerRef handler;
+    if (!pthread_main_np()) {
+        return paramErr;
+    }
+    deliverEvent = deliver;
+    installSwipeMonitor();
+
+    if (hotKey != NULL) {
+        return noErr;
+    }
+
+    EventTargetRef target = GetApplicationEventTarget();
+    if (handler == NULL) {
+        const EventTypeSpec types[] = {
+            {kEventClassKeyboard, kEventHotKeyPressed},
+            {kEventClassKeyboard, kEventHotKeyReleased},
+        };
+        OSStatus status = InstallEventHandler(target, handleHotKey, 2, types, NULL, &handler);
+        if (status != noErr) {
+            return status;
+        }
+    }
+
+    return RegisterEventHotKey(kVK_ANSI_N, optionKey, toggleID, target,
+                               kEventHotKeyExclusive, &hotKey);
+}
