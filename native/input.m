@@ -114,3 +114,47 @@ int32_t handynotes_input_install(void (*deliver)(int32_t)) {
     return RegisterEventHotKey(kVK_ANSI_N, optionKey, toggleID, target,
                                kEventHotKeyExclusive, &hotKey);
 }
+
+// Tracks the top row even when AppKit's traffic lights own the mouse event.
+@interface HNToolbarRegion : NSView
+@end
+
+@implementation HNToolbarRegion
+- (NSView *)hitTest:(NSPoint)point { return nil; }
+
+- (void)setControlsVisible:(BOOL)visible {
+    for (NSUInteger type = NSWindowCloseButton; type <= NSWindowZoomButton; type++) {
+        NSButton *button = [self.window standardWindowButton:type];
+        if (visible && button.hidden) {
+            button.alphaValue = 0;
+            button.hidden = NO;
+            [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
+                context.duration = NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion ? 0 : 0.11;
+                button.animator.alphaValue = 1;
+            } completionHandler:nil];
+        } else if (!visible) {
+            button.hidden = YES;
+        }
+    }
+    deliverEvent(visible ? 4 : 5);
+}
+- (void)mouseEntered:(NSEvent *)event { [self setControlsVisible:YES]; }
+- (void)mouseExited:(NSEvent *)event { [self setControlsVisible:NO]; }
+@end
+
+void handynotes_track_toolbar(void *ptr) {
+    NSView *content = (__bridge NSView *)ptr;
+    const CGFloat height = 40;
+    NSRect frame = content.bounds;
+    frame.origin.y = content.isFlipped ? NSMinY(frame) : NSMaxY(frame) - height;
+    frame.size.height = height;
+    HNToolbarRegion *region = [[HNToolbarRegion alloc] initWithFrame:frame];
+    region.autoresizingMask = NSViewWidthSizable |
+        (content.isFlipped ? NSViewMaxYMargin : NSViewMinYMargin);
+    [content addSubview:region];
+    [region addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
+        options:NSTrackingInVisibleRect | NSTrackingActiveAlways | NSTrackingMouseEnteredAndExited
+        owner:region userInfo:nil]];
+    NSPoint mouse = [region convertPoint:content.window.mouseLocationOutsideOfEventStream fromView:nil];
+    [region setControlsVisible:NSPointInRect(mouse, region.bounds)];
+}

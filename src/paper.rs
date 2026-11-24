@@ -7,8 +7,8 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::{
     Animation, AnimationExt, App, AppContext as _, Bounds, Context, Entity, FontWeight,
-    HighlightStyle, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window,
-    canvas, div, ease_out_quint, fill, point, px, rgb, size,
+    HighlightStyle, IntoElement, ParentElement, SharedString, Styled, Window, canvas, div,
+    ease_out_quint, fill, point, px, rgb, size,
 };
 
 const PAPER: u32 = 0xffffff;
@@ -45,12 +45,11 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<
     })
 }
 
-pub fn paper(
-    state: &Entity<EditorState>,
-    direction: Option<isize>,
-    controls: impl IntoElement,
-) -> impl IntoElement {
-    let editor = div().size_full().pt(px(15.)).pl(px(17.)).child(
+pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) -> impl IntoElement {
+    // Account for the editor's built-in line leading and horizontal inset.
+    // Consume the extra first-line space as the document scrolls.
+    let first_line_space = (px(15.) + state.read(cx).scroll_offset().y).clamp(px(0.), px(15.));
+    let editor = div().size_full().pt(first_line_space).pl(px(17.)).child(
         Editor::new(state)
             .aria_label("Note")
             .appearance(false)
@@ -107,19 +106,6 @@ pub fn paper(
             .inset_0(),
         )
         .child(editor)
-        .child(
-            div()
-                .group("footer")
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right(px(5.))
-                .h(px(56.))
-                .flex()
-                .flex_col()
-                .justify_end()
-                .child(controls),
-        )
 }
 
 #[derive(Default)]

@@ -27,6 +27,7 @@ struct Notebook {
     scroll: ScrollHandle,
     error: Option<String>,
     shortcut_available: bool,
+    toolbar_visible: bool,
 }
 
 impl Notebook {
@@ -43,12 +44,16 @@ impl Notebook {
         .detach();
         let editor = paper::editor_state("", window, cx);
         let (tx, rx) = async_channel::unbounded();
-        let shortcut_available = native::install(tx);
+        let shortcut_available = native::install(window, tx);
         cx.spawn_in(window, async move |view, cx| {
             while let Ok(event) = rx.recv().await {
                 if cx
                     .update(|window, cx| {
                         view.update(cx, |this, cx| match event {
+                            native::Event::Toolbar(visible) => {
+                                this.toolbar_visible = visible;
+                                cx.notify();
+                            }
                             native::Event::Toggle => {
                                 if window.is_window_active() {
                                     this.hide(cx);
@@ -88,6 +93,7 @@ impl Notebook {
             scroll: ScrollHandle::new(),
             error: None,
             shortcut_available,
+            toolbar_visible: false,
         };
         this.attach_editor(window, cx);
         this
@@ -385,58 +391,68 @@ impl Render for Notebook {
             .flex_col()
             .bg(white())
             .text_color(rgb(0x443e37))
-            .capture_key_down(cx.listener(Self::key))
-            .child(
-                div()
-                    .h(px(27.))
-                    .flex_shrink_0()
-                    .on_mouse_down(MouseButton::Left, |_, w, _| w.start_window_move()),
-            );
+            .relative()
+            .capture_key_down(cx.listener(Self::key));
         view = if self.searching {
-            view.child(self.browser(cx))
+            view.child(div().h(px(44.)).flex_shrink_0())
+                .child(self.browser(cx))
         } else {
-            let ids = self.ids();
-            let pos = ids.iter().position(|id| Some(*id) == self.current);
-            let count = pos
-                .map(|i| format!("{} / {}", i + 1, ids.len()))
-                .unwrap_or_else(|| "New note".into());
-            let controls = div()
-                .invisible()
-                .group_hover("footer", |s| s.visible())
-                .bg(linear_gradient(
-                    180.,
-                    linear_color_stop(white().opacity(0.), 0.),
-                    linear_color_stop(white(), 0.58),
-                ))
-                .flex()
-                .items_center()
-                .justify_between()
-                .px_3()
-                .pt(px(26.))
-                .pb_2()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(tool("‹", cx.listener(|s, _, w, cx| s.step(-1, w, cx))))
-                        .child(div().text_xs().text_color(rgb(0x807c75)).child(count))
-                        .child(tool("›", cx.listener(|s, _, w, cx| s.step(1, w, cx)))),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(tool(
-                            "Search ⌘F",
-                            cx.listener(|s, _, w, cx| s.search(w, cx)),
-                        ))
-                        .child(tool(
-                            "+ New",
-                            cx.listener(|s, _, w, cx| s.open(None, w, cx)),
-                        )),
-                );
-            view.child(paper::paper(&self.editor, self.slide_direction, controls))
+            view.child(paper::paper(&self.editor, self.slide_direction, cx))
         };
+        if self.toolbar_visible {
+            use kit::component::{Icon, IconName};
+            let action = |id: &'static str| {
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h(px(24.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0xeeeeec)))
+            };
+            view = view.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(54.))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(white().opacity(0.98), 0.25),
+                        linear_color_stop(white().opacity(0.), 1.),
+                    ))
+                    .flex()
+                    .items_start()
+                    .pt(px(12.))
+                    .pr(px(12.))
+                    .child(
+                        div()
+                            .h(px(24.))
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Left, |_, w, _| w.start_window_move()),
+                    )
+                    .child(
+                        action("search-notes")
+                            .child(Icon::new(IconName::Search).size(px(14.)))
+                            .child(div().text_xs().child("⌘F"))
+                            .on_click(cx.listener(|s, _, w, cx| s.search(w, cx))),
+                    )
+                    .child(
+                        action("new-note")
+                            .child(Icon::new(IconName::Plus).size(px(16.)))
+                            .on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx))),
+                    )
+                    .with_animation(
+                        "toolbar-reveal",
+                        Animation::new(std::time::Duration::from_millis(110)),
+                        |bar, t| bar.opacity(t),
+                    ),
+            );
+        }
         if let Some(msg) = &self.error {
             view = view.child(
                 div()
@@ -473,9 +489,11 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(320.), px(220.))),
+                    app_owns_titlebar_drag: true,
                     titlebar: Some(TitlebarOptions {
                         title: Some("HandyNotes".into()),
                         appears_transparent: true,
+                        traffic_light_position: Some(point(px(16.), px(16.))),
                         ..Default::default()
                     }),
                     ..Default::default()

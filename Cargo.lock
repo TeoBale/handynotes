@@ -2656,6 +2656,7 @@ dependencies = [
  "async-channel",
  "chrono",
  "gpui-kit",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "tempfile",
