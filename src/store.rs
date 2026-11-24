@@ -128,10 +128,26 @@ impl NoteStore {
         self.save(notes)
     }
 
-    pub fn delete(&mut self, id: u64) -> io::Result<()> {
+    pub fn delete(&mut self, id: u64) -> io::Result<Note> {
         let index = self.index_of(id)?;
         let mut notes = self.notes.clone();
-        notes.entries.remove(index);
+        let deleted = notes.entries.remove(index);
+        self.save(notes)?;
+        Ok(deleted)
+    }
+
+    pub fn restore(&mut self, note: &Note) -> io::Result<()> {
+        if self.get(note.id).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Note already exists",
+            ));
+        }
+        let mut notes = self.notes.clone();
+        let index = notes
+            .entries
+            .partition_point(|n| n.updated_at > note.updated_at);
+        notes.entries.insert(index, note.clone());
         self.save(notes)
     }
 

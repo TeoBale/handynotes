@@ -14,7 +14,15 @@ mod native;
 mod paper;
 mod store;
 
+struct DeletedNote {
+    note: store::Note,
+    undo_target: EntityId,
+    target_text: SharedString,
+}
+
 struct Notebook {
+    editors: std::collections::HashMap<u64, Entity<EditorState>>,
+    deletions: Vec<DeletedNote>,
     store: NoteStore,
     current: Option<u64>,
     editor: Entity<EditorState>,
@@ -81,6 +89,8 @@ impl Notebook {
             false
         });
         let mut this = Self {
+            editors: Default::default(),
+            deletions: Vec::new(),
             store,
             current: None,
             editor,
@@ -145,8 +155,15 @@ impl Notebook {
         }
         self.slide_direction = None;
         if self.current != id {
-            let body = id.and_then(|id| self.store.get(id)).map_or("", |n| &n.body);
-            self.editor = paper::editor_state(body, window, cx);
+            if let Some(previous) = self.current {
+                self.editors.insert(previous, self.editor.clone());
+            }
+            self.editor = id
+                .and_then(|id| self.editors.remove(&id))
+                .unwrap_or_else(|| {
+                    let body = id.and_then(|id| self.store.get(id)).map_or("", |n| &n.body);
+                    paper::editor_state(body, window, cx)
+                });
             self.current = id;
             self.attach_editor(window, cx);
         }
@@ -202,6 +219,26 @@ impl Notebook {
     fn key(&mut self, e: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
         match (k.modifiers.platform, k.key.as_str()) {
+            (true, "d")
+                if !self.searching
+                    && !k.modifiers.shift
+                    && !k.modifiers.alt
+                    && !k.modifiers.control =>
+            {
+                if !e.is_held
+                    && let Some(id) = self.current
+                {
+                    self.remove_note(id, w, cx);
+                }
+            }
+            (true, "z")
+                if !k.modifiers.shift
+                    && !k.modifiers.alt
+                    && !k.modifiers.control
+                    && self.can_restore(cx) =>
+            {
+                self.restore_note(w, cx);
+            }
             (true, "f" | "p") => self.search(w, cx),
             (true, "n") => self.open(None, w, cx),
             (true, "w") | (false, "escape") if !self.searching => self.hide(cx),
@@ -242,19 +279,79 @@ impl Notebook {
             self.pending_delete = Some(id);
         } else {
             self.pending_delete = None;
-            match self.store.delete(id) {
-                Ok(()) => {
-                    if self.current == Some(id) {
-                        self.current = None;
-                        self.editor = paper::editor_state("", window, cx);
-                        self.attach_editor(window, cx);
+            self.remove_note(id, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn undo_context(&self, cx: &App) -> (EntityId, SharedString) {
+        if self.searching {
+            (self.query.entity_id(), self.query.read(cx).value())
+        } else {
+            (self.editor.entity_id(), self.editor.read(cx).value())
+        }
+    }
+
+    fn can_restore(&self, cx: &App) -> bool {
+        self.deletions.last().is_some_and(|entry| {
+            let (target, text) = self.undo_context(cx);
+            entry.undo_target == target && entry.target_text == text
+        })
+    }
+
+    fn remove_note(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.save(cx) {
+            cx.notify();
+            return;
+        }
+        match self.store.delete(id) {
+            Ok(note) => {
+                if self.current == Some(id) {
+                    self.editors.insert(id, self.editor.clone());
+                    self.current = None;
+                    self.editor = paper::editor_state("", window, cx);
+                    self.attach_editor(window, cx);
+                    if self.searching {
                         window.focus(&self.query.focus_handle(cx), cx);
+                    } else {
+                        let ids = self.ids();
+                        let next = ids
+                            .iter()
+                            .copied()
+                            .find(|other| *other > id)
+                            .or_else(|| ids.last().copied());
+                        self.open(next, window, cx);
                     }
-                    self.selected = 0;
-                    self.error = None;
                 }
-                Err(error) => self.error = Some(format!("Couldn’t delete this note · {error}")),
+                let (undo_target, target_text) = self.undo_context(cx);
+                self.deletions.push(DeletedNote {
+                    note,
+                    undo_target,
+                    target_text,
+                });
+                self.selected = 0;
+                self.pending_delete = None;
+                self.error = None;
             }
+            Err(error) => self.error = Some(format!("Couldn’t delete this note · {error}")),
+        }
+        cx.notify();
+    }
+
+    fn restore_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.deletions.last() else {
+            return;
+        };
+        let id = entry.note.id;
+        match self.store.restore(&entry.note) {
+            Ok(()) => {
+                self.deletions.pop();
+                self.error = None;
+                if !self.searching {
+                    self.open(Some(id), window, cx);
+                }
+            }
+            Err(error) => self.error = Some(format!("Couldn’t restore this note · {error}")),
         }
         cx.notify();
     }
@@ -392,6 +489,12 @@ impl Render for Notebook {
             .bg(white())
             .text_color(rgb(0x443e37))
             .relative()
+            .capture_action(cx.listener(|this, _: &kit::base::input::Undo, window, cx| {
+                if this.can_restore(cx) {
+                    this.restore_note(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .capture_key_down(cx.listener(Self::key));
         view = if self.searching {
             view.child(div().h(px(44.)).flex_shrink_0())
@@ -494,7 +597,6 @@ fn main() {
                         title: Some("HandyNotes".into()),
                         appears_transparent: true,
                         traffic_light_position: Some(point(px(16.), px(16.))),
-                        ..Default::default()
                     }),
                     ..Default::default()
                 },
