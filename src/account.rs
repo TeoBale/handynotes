@@ -1,5 +1,9 @@
 use super::*;
 use crate::sync::{Event, Request};
+use std::time::Duration;
+
+const SYNC_DELAY: Duration = Duration::from_millis(350);
+const POLL_INTERVAL: Duration = Duration::from_secs(4);
 
 pub(super) struct Account {
     pub visible: bool,
@@ -11,6 +15,7 @@ pub(super) struct Account {
     busy: bool,
     status: String,
     version: Option<f64>,
+    scheduled_sync: Option<Task<()>>,
 }
 
 impl Account {
@@ -25,6 +30,7 @@ impl Account {
             busy: false,
             status: String::new(),
             version: None,
+            scheduled_sync: None,
         }
     }
 }
@@ -62,18 +68,26 @@ impl Notebook {
         })
         .detach();
         let executor = cx.background_executor().clone();
-        cx.spawn_in(window, async move |view, cx| {
+        cx.spawn(async move |view, cx| {
             loop {
-                executor.timer(std::time::Duration::from_secs(4)).await;
-                if cx
-                    .update(|_, cx| view.update(cx, |this, _| this.sync_notes()))
-                    .is_err()
-                {
+                executor.timer(POLL_INTERVAL).await;
+                if view.update(cx, |this, _| this.sync_notes()).is_err() {
                     break;
                 }
             }
         })
         .detach();
+    }
+
+    pub(super) fn schedule_sync(&mut self, cx: &mut Context<Self>) {
+        if self.store.active_account().is_none() {
+            return;
+        }
+        let delay = cx.background_executor().timer(SYNC_DELAY);
+        self.account.scheduled_sync = Some(cx.spawn(async move |view, cx| {
+            delay.await;
+            let _ = view.update(cx, |this, _| this.sync_notes());
+        }));
     }
 
     fn request(&mut self, request: Request) {

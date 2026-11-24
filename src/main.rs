@@ -135,7 +135,7 @@ impl Notebook {
         window.focus(&self.editor.focus_handle(cx), cx);
     }
 
-    fn save(&mut self, cx: &App) -> bool {
+    fn save(&mut self, cx: &mut Context<Self>) -> bool {
         let body = self.editor.read(cx).value();
         let title = body
             .lines()
@@ -146,21 +146,37 @@ impl Notebook {
             .trim();
         let title: String = title.chars().take(100).collect();
         let result = match self.current {
-            Some(id) if self.store.get(id).is_some_and(|n| n.body == body.as_ref()) => Ok(()),
+            Some(id) if self.store.get(id).is_some_and(|n| n.body == body.as_ref()) => {
+                self.error = None;
+                return true;
+            }
             Some(id) => self.store.update(id, &title, &body),
-            None if body.is_empty() => Ok(()),
+            None if body.trim().is_empty() => {
+                self.error = None;
+                return true;
+            }
             None => self
                 .store
                 .create_with_body(&title, &body)
                 .map(|id| self.current = Some(id)),
         };
+        if result.is_ok() {
+            self.schedule_sync(cx);
+        }
         self.error = result
             .err()
             .map(|e| format!("Couldn’t save this note · {e}"));
         self.error.is_none()
     }
 
+    fn can_create_note(&self, cx: &App) -> bool {
+        !self.editor.read(cx).value().trim().is_empty()
+    }
+
     fn open(&mut self, id: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if id.is_none() && self.current.is_some() && !self.can_create_note(cx) {
+            return;
+        }
         if !self.save(cx) {
             cx.notify();
             return;
@@ -357,6 +373,7 @@ impl Notebook {
                 self.selected = 0;
                 self.pending_delete = None;
                 self.error = None;
+                self.schedule_sync(cx);
             }
             Err(error) => self.error = Some(format!("Couldn’t delete this note · {error}")),
         }
@@ -372,6 +389,7 @@ impl Notebook {
             Ok(()) => {
                 self.deletions.pop();
                 self.error = None;
+                self.schedule_sync(cx);
                 if !self.searching {
                     self.open(Some(id), window, cx);
                 }
@@ -531,7 +549,7 @@ impl Render for Notebook {
         };
         if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};
-            let action = |id: &'static str| {
+            let action = |id: &'static str, enabled| {
                 div()
                     .id(id)
                     .flex()
@@ -540,9 +558,12 @@ impl Render for Notebook {
                     .px_2()
                     .h(px(24.))
                     .rounded_md()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0xeeeeec)))
+                    .when(enabled, |s| {
+                        s.cursor_pointer().hover(|s| s.bg(rgb(0xeeeeec)))
+                    })
+                    .when(!enabled, |s| s.opacity(0.35))
             };
+            let can_create_note = self.can_create_note(cx);
             view = view.child(
                 div()
                     .absolute()
@@ -566,19 +587,21 @@ impl Render for Notebook {
                             .on_mouse_down(MouseButton::Left, |_, w, _| w.start_window_move()),
                     )
                     .child(tool(
-                        "Sync",
+                        "Account",
                         cx.listener(|s, _, w, cx| s.open_account(w, cx)),
                     ))
                     .child(
-                        action("search-notes")
+                        action("search-notes", true)
                             .child(Icon::new(IconName::Search).size(px(14.)))
                             .child(div().text_xs().child("⌘F"))
                             .on_click(cx.listener(|s, _, w, cx| s.search(w, cx))),
                     )
                     .child(
-                        action("new-note")
+                        action("new-note", can_create_note)
                             .child(Icon::new(IconName::Plus).size(px(16.)))
-                            .on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx))),
+                            .when(can_create_note, |s| {
+                                s.on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx)))
+                            }),
                     )
                     .with_animation(
                         "toolbar-reveal",

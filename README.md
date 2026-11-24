@@ -5,7 +5,7 @@ A small macOS scratchpad built with Rust, GPUI and GPUI Kit. While HandyNotes is
 - Swipe horizontally with two fingers to browse one note at a time. Swipe right for an older note and left for a newer one. Move the pointer into the top row to reveal the macOS window controls, Search (⌘F), and New (+). Command–[ / Command–] also browse notes.
 - Press **Command–F** to search all notes by their contents. Use the arrow keys and Return, or click a result. Escape returns to the editor. Click Delete twice to confirm removal.
 - Press **Command–D** to delete the open note and **Command–Z** to restore it. Each note keeps its own editing history while the app is running, including when you switch notes.
-- Press **Command–N** for a new note or **Command–Q** to quit. Drag the top edge to move the window, or drag a corner to resize it.
+- Press **Command–N** for a new note once the current page contains text, or **Command–Q** to quit. Drag the top edge to move the window, or drag a corner to resize it.
 
 Notes live in `~/Library/Application Support/HandyNotes/notes.json`. Blank drafts are saved only after typing. A shortcut conflict appears at the bottom of the window if another application owns Option–N.
 
@@ -22,9 +22,9 @@ You can move the resulting bundle into Applications. For development, run `cargo
 
 ## Sync across Macs with Convex
 
-Each Mac connects to the same Convex deployment. Open **Sync** in the top toolbar (or press **Command–comma**), create an account on the first Mac, and sign in with the same email and password on the others. Signing in imports that Mac’s local notes into the account. Signing out returns to the local notebook and keeps the account’s cached notes and pending edits on disk for the next sign-in.
+Each Mac connects to the same Convex deployment. Open **Account** in the top toolbar (or press **Command–comma**), create an account on the first Mac, and sign in with the same email and password on the others. Signing in imports that Mac’s local notes into the account. Signing out returns to the local notebook and keeps the account’s cached notes and pending edits on disk for the next sign-in.
 
-Notes still save locally as you type. While signed in, HandyNotes checks for updates every four seconds and retries after a connection failure. Closing the window keeps sync running. Quitting the app pauses it. If two devices edit the same note, the last upload accepted by Convex wins, including an edit made offline. The **Sync** panel shows connection errors and sync status. Credentials for the session are stored in the macOS login Keychain.
+Notes save locally as you type. Once you sign in, HandyNotes automatically uploads edits and deletions in the background. It checks for updates every four seconds and retries after a connection failure. Closing the window keeps sync running. Quitting the app pauses it. If two devices edit the same note, the last upload accepted by Convex wins, including an edit made offline. The **Account** panel shows connection errors and sync status. Credentials for the session are stored in the macOS login Keychain.
 
 ### Connect a deployment
 
