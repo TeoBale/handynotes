@@ -1,12 +1,13 @@
-use std::{ops::Range, rc::Rc};
+use std::{ops::Range, rc::Rc, time::Duration};
 
 use gpui_kit::component::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
     RopeExt,
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, FontWeight, HighlightStyle, IntoElement,
-    ParentElement, SharedString, Styled, Window, canvas, div, fill, point, px, rgb, size,
+    Animation, AnimationExt, App, AppContext as _, Bounds, Context, Entity, FontWeight,
+    HighlightStyle, InteractiveElement, IntoElement, ParentElement, SharedString, Styled, Window,
+    canvas, div, ease_out_quint, fill, point, px, rgb, size,
 };
 
 const PAPER: u32 = 0xffffff;
@@ -33,7 +34,34 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<
     })
 }
 
-pub fn paper(state: &Entity<EditorState>) -> impl IntoElement {
+pub fn paper(
+    state: &Entity<EditorState>,
+    direction: Option<isize>,
+    controls: impl IntoElement,
+) -> impl IntoElement {
+    let editor = div().size_full().pt(px(15.)).px(px(17.)).pb(px(40.)).child(
+        Editor::new(state)
+            .aria_label("Note")
+            .appearance(false)
+            .h(gpui_kit::relative(1.0))
+            .text_color(rgb(INK))
+            .text_size(px(13.))
+            .line_height(px(23.)),
+    );
+    let editor = match direction {
+        Some(direction) => editor
+            .with_animation(
+                ("note-slide", state.entity_id()),
+                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                move |editor, progress| {
+                    editor
+                        .left(px(22. * direction as f32 * (1. - progress)))
+                        .opacity(0.78 + 0.22 * progress)
+                },
+            )
+            .into_any_element(),
+        None => editor.into_any_element(),
+    };
     div()
         .relative()
         .flex_1()
@@ -67,16 +95,19 @@ pub fn paper(state: &Entity<EditorState>) -> impl IntoElement {
             .absolute()
             .inset_0(),
         )
+        .child(editor)
         .child(
-            div().size_full().pt(px(15.)).px(px(17.)).child(
-                Editor::new(state)
-                    .aria_label("Note")
-                    .appearance(false)
-                    .h(gpui_kit::relative(1.0))
-                    .text_color(rgb(INK))
-                    .text_size(px(13.))
-                    .line_height(px(23.)),
-            ),
+            div()
+                .group("footer")
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .h(px(56.))
+                .flex()
+                .flex_col()
+                .justify_end()
+                .child(controls),
         )
 }
 

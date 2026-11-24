@@ -1,8 +1,8 @@
 # HandyNotes
 
-A small macOS scratchpad built with Rust, GPUI and GPUI Kit. While HandyNotes is running, **Option–N** brings a blank note to the front from any application. Typing saves it locally. Closing the window or pressing Escape hides it and keeps the shortcut active.
+A small macOS scratchpad built with Rust, GPUI and GPUI Kit. While HandyNotes is running, **Option–N** hides the active window or brings it back from another application. Your current note or search stays open. Typing saves it locally. Closing the window or pressing Escape hides it and keeps the shortcut active.
 
-- Swipe horizontally with two fingers to browse one note at a time. Swipe right for an older note and left for a newer one. The footer arrows and Command–[ / Command–] do the same.
+- Swipe horizontally with two fingers to browse one note at a time. Swipe right for an older note and left for a newer one. Move the pointer near the bottom edge to reveal the footer arrows, Search, and New. Command–[ / Command–] also browse notes.
 - Press **Command–F** to search all notes by their contents. Use the arrow keys and Return, or click a result. Escape returns to the editor. Click Delete twice to confirm removal.
 - Press **Command–N** for a new note or **Command–Q** to quit. Drag the top edge to move the window, or drag a corner to resize it.
 

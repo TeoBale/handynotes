@@ -21,6 +21,7 @@ struct Notebook {
     query: Entity<InputState>,
     editor_events: Option<Subscription>,
     searching: bool,
+    slide_direction: Option<isize>,
     selected: usize,
     pending_delete: Option<u64>,
     scroll: ScrollHandle,
@@ -49,9 +50,12 @@ impl Notebook {
                     .update(|window, cx| {
                         view.update(cx, |this, cx| match event {
                             native::Event::Toggle => {
-                                cx.activate(true);
-                                window.activate_window();
-                                this.open(None, window, cx);
+                                if window.is_window_active() {
+                                    this.hide(cx);
+                                } else {
+                                    cx.activate(true);
+                                    window.activate_window();
+                                }
                             }
                             native::Event::SwipeLeft if !this.searching => this.step(1, window, cx),
                             native::Event::SwipeRight if !this.searching => {
@@ -78,6 +82,7 @@ impl Notebook {
             query,
             editor_events: None,
             searching: false,
+            slide_direction: None,
             selected: 0,
             pending_delete: None,
             scroll: ScrollHandle::new(),
@@ -132,6 +137,7 @@ impl Notebook {
             cx.notify();
             return;
         }
+        self.slide_direction = None;
         if self.current != id {
             let body = id.and_then(|id| self.store.get(id)).map_or("", |n| &n.body);
             self.editor = paper::editor_state(body, window, cx);
@@ -157,7 +163,11 @@ impl Notebook {
             .unwrap_or(ids.len());
         let next = pos.saturating_add_signed(delta).min(ids.len());
         if pos != next {
-            self.open(ids.get(next).copied(), window, cx);
+            let id = ids.get(next).copied();
+            self.open(id, window, cx);
+            if self.current == id {
+                self.slide_direction = Some(delta);
+            }
         }
     }
 
@@ -175,18 +185,20 @@ impl Notebook {
         cx.notify();
     }
 
+    fn hide(&mut self, cx: &mut Context<Self>) {
+        if self.save(cx) {
+            cx.hide();
+        } else {
+            cx.notify();
+        }
+    }
+
     fn key(&mut self, e: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
         match (k.modifiers.platform, k.key.as_str()) {
             (true, "f" | "p") => self.search(w, cx),
             (true, "n") => self.open(None, w, cx),
-            (true, "w") | (false, "escape") if !self.searching => {
-                if self.save(cx) {
-                    cx.hide();
-                } else {
-                    cx.notify();
-                }
-            }
+            (true, "w") | (false, "escape") if !self.searching => self.hide(cx),
             (true, "q") => {
                 if self.save(cx) {
                     cx.quit();
@@ -388,35 +400,37 @@ impl Render for Notebook {
             let count = pos
                 .map(|i| format!("{} / {}", i + 1, ids.len()))
                 .unwrap_or_else(|| "New note".into());
-            view.child(paper::paper(&self.editor)).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(tool("‹", cx.listener(|s, _, w, cx| s.step(-1, w, cx))))
-                            .child(div().text_xs().text_color(rgb(0x807c75)).child(count))
-                            .child(tool("›", cx.listener(|s, _, w, cx| s.step(1, w, cx)))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(tool(
-                                "Search ⌘F",
-                                cx.listener(|s, _, w, cx| s.search(w, cx)),
-                            ))
-                            .child(tool(
-                                "+ New",
-                                cx.listener(|s, _, w, cx| s.open(None, w, cx)),
-                            )),
-                    ),
-            )
+            let controls = div()
+                .invisible()
+                .group_hover("footer", |s| s.visible())
+                .bg(white())
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(tool("‹", cx.listener(|s, _, w, cx| s.step(-1, w, cx))))
+                        .child(div().text_xs().text_color(rgb(0x807c75)).child(count))
+                        .child(tool("›", cx.listener(|s, _, w, cx| s.step(1, w, cx)))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(tool(
+                            "Search ⌘F",
+                            cx.listener(|s, _, w, cx| s.search(w, cx)),
+                        ))
+                        .child(tool(
+                            "+ New",
+                            cx.listener(|s, _, w, cx| s.open(None, w, cx)),
+                        )),
+                );
+            view.child(paper::paper(&self.editor, self.slide_direction, controls))
         };
         if let Some(msg) = &self.error {
             view = view.child(
