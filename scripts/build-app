@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+case "${1:-release}" in
+    debug) cargo build --locked; profile=debug ;;
+    release) cargo build --locked --release; profile=release ;;
+    *) echo "Usage: scripts/build-app [debug|release]" >&2; exit 2 ;;
+esac
+app="target/HandyNotes.app"
+mkdir -p "$app/Contents/MacOS"
+cp "target/$profile/handynotes" "$app/Contents/MacOS/HandyNotes"
+cp native/Info.plist "$app/Contents/Info.plist"
+codesign --force --sign - "$app"
+echo "$PWD/$app"
