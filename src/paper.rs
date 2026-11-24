@@ -1,5 +1,6 @@
 use std::{ops::Range, rc::Rc, time::Duration};
 
+use gpui_kit::base::Scrollbar;
 use gpui_kit::component::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
     RopeExt,
@@ -29,6 +30,16 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<
             .auto_close(false)
             .smart_indent(false)
             .searchable(false);
+        state.set_scrollbar_renderer(Some(Rc::new(|viewport, _, _| {
+            Scrollbar::vertical(&viewport)
+                .styles(|styles| {
+                    styles
+                        .thumb(|thumb| thumb.width(px(3.)).inset(px(0.)))
+                        .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
+                        .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
+                })
+                .into_any_element()
+        })));
         state.set_highlighter_factory(Rc::new(|_| Some(Box::<MarkdownHeadings>::default())), cx);
         state
     })
@@ -39,7 +50,7 @@ pub fn paper(
     direction: Option<isize>,
     controls: impl IntoElement,
 ) -> impl IntoElement {
-    let editor = div().size_full().pt(px(15.)).px(px(17.)).pb(px(40.)).child(
+    let editor = div().size_full().pt(px(15.)).pl(px(17.)).child(
         Editor::new(state)
             .aria_label("Note")
             .appearance(false)
@@ -52,10 +63,10 @@ pub fn paper(
         Some(direction) => editor
             .with_animation(
                 ("note-slide", state.entity_id()),
-                Animation::new(Duration::from_millis(160)).with_easing(ease_out_quint()),
+                Animation::new(Duration::from_millis(210)).with_easing(ease_out_quint()),
                 move |editor, progress| {
                     editor
-                        .left(px(22. * direction as f32 * (1. - progress)))
+                        .left(px(96. * direction as f32 * (1. - progress)))
                         .opacity(0.78 + 0.22 * progress)
                 },
             )
@@ -102,7 +113,7 @@ pub fn paper(
                 .absolute()
                 .bottom_0()
                 .left_0()
-                .right_0()
+                .right(px(5.))
                 .h(px(56.))
                 .flex()
                 .flex_col()

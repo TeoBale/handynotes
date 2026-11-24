@@ -403,12 +403,17 @@ impl Render for Notebook {
             let controls = div()
                 .invisible()
                 .group_hover("footer", |s| s.visible())
-                .bg(white())
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(white().opacity(0.), 0.),
+                    linear_color_stop(white(), 0.58),
+                ))
                 .flex()
                 .items_center()
                 .justify_between()
                 .px_3()
-                .py_2()
+                .pt(px(26.))
+                .pb_2()
                 .child(
                     div()
                         .flex()
