@@ -1,0 +1,311 @@
+use super::*;
+use crate::sync::{Event, Request};
+
+pub(super) struct Account {
+    pub visible: bool,
+    focus: FocusHandle,
+    logout_requested: bool,
+    email: Entity<InputState>,
+    password: Entity<InputState>,
+    requests: Option<async_channel::Sender<Request>>,
+    busy: bool,
+    status: String,
+    version: Option<f64>,
+}
+
+impl Account {
+    pub fn new(window: &mut Window, cx: &mut Context<Notebook>) -> Self {
+        Self {
+            visible: false,
+            focus: cx.focus_handle(),
+            logout_requested: false,
+            email: cx.new(|cx| InputState::new(window, cx).placeholder("Email")),
+            password: password_input(window, cx),
+            requests: None,
+            busy: false,
+            status: String::new(),
+            version: None,
+        }
+    }
+}
+
+fn password_input(window: &mut Window, cx: &mut Context<Notebook>) -> Entity<InputState> {
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder("Password")
+            .masked(true)
+    })
+}
+
+impl Notebook {
+    pub(super) fn start_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = std::env::var("CONVEX_URL")
+            .ok()
+            .or_else(|| option_env!("CONVEX_URL").map(str::to_owned));
+        let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+            self.account.status =
+                "Set CONVEX_URL when building or launching HandyNotes to enable sync.".into();
+            return;
+        };
+        let (requests, events) = sync::connect(url);
+        self.account.requests = Some(requests);
+        self.account.busy = true;
+        cx.spawn_in(window, async move |view, cx| {
+            while let Ok(event) = events.recv().await {
+                if cx
+                    .update(|w, cx| view.update(cx, |this, cx| this.cloud_event(event, w, cx)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let executor = cx.background_executor().clone();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                executor.timer(std::time::Duration::from_secs(4)).await;
+                if cx
+                    .update(|_, cx| view.update(cx, |this, _| this.sync_notes()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn request(&mut self, request: Request) {
+        if self.account.busy {
+            return;
+        }
+        if let Some(tx) = &self.account.requests {
+            match tx.try_send(request) {
+                Ok(()) => self.account.busy = true,
+                Err(_) => self.account.status = "Cloud connection unavailable. Restart HandyNotes after checking the deployment URL.".into(),
+            }
+        }
+    }
+
+    fn logout(&mut self, cx: &mut Context<Self>) {
+        self.account.logout_requested = true;
+        self.account.status = "Signing out…".into();
+        if !self.account.busy {
+            self.account.logout_requested = false;
+            self.request(Request::Logout);
+        }
+        cx.notify();
+    }
+
+    fn sync_notes(&mut self) {
+        if !self.account.busy
+            && let Some(account) = self.store.active_account()
+        {
+            self.request(Request::Sync {
+                account: account.to_owned(),
+                pending: self.store.pending(),
+                version: self.account.version,
+            });
+        }
+    }
+
+    fn sync_status(&self) -> String {
+        if self.store.pending().is_empty() {
+            "Up to date".into()
+        } else {
+            "Changes waiting to sync".into()
+        }
+    }
+
+    fn cloud_event(&mut self, event: Event, w: &mut Window, cx: &mut Context<Self>) {
+        self.account.busy = false;
+        match event {
+            Event::Current => self.account.status = self.sync_status(),
+            Event::PullFailed {
+                account,
+                sent,
+                error,
+            } => {
+                self.account.status = self
+                    .store
+                    .acknowledge(&account, &sent)
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or(error);
+            }
+            Event::Error(message) => self.account.status = message,
+            Event::Session { account, adopt } => {
+                if !self.save(cx) {
+                    cx.notify();
+                    return;
+                }
+                let switching = account.as_deref() != self.store.active_account();
+                let result = match account {
+                    Some(ref owner) => self.store.sign_in(owner, adopt),
+                    None => self.store.sign_out(),
+                };
+                if let Err(error) = result {
+                    self.account.status = error.to_string();
+                } else {
+                    self.account.version = None;
+                    if switching {
+                        self.editors.clear();
+                        self.deletions.clear();
+                        self.searching = false;
+                        self.pending_delete = None;
+                        self.selected = 0;
+                        self.current = None;
+                        self.query.update(cx, |s, cx| s.set_value("", w, cx));
+                        self.editor = paper::editor_state("", w, cx);
+                        self.attach_editor(w, cx);
+                        if self.account.visible {
+                            w.focus(&self.account.focus, cx);
+                        }
+                    }
+                    self.account.status = if account.is_some() {
+                        "Syncing…".into()
+                    } else {
+                        "Saved on this Mac".into()
+                    };
+                    self.sync_notes();
+                }
+            }
+            Event::Snapshot {
+                version,
+                account,
+                sent,
+                notes,
+                upload_error,
+            } => {
+                if self.store.active_account() != Some(&account) || !self.save(cx) {
+                    cx.notify();
+                    return;
+                }
+                if let Err(error) = self.store.apply_sync(&account, &sent, notes) {
+                    self.account.status = error.to_string();
+                } else {
+                    self.account.version = Some(version);
+                    self.editors.retain(|id, editor| {
+                        self.store
+                            .get(*id)
+                            .is_some_and(|n| n.body == editor.read(cx).value().as_ref())
+                    });
+                    if let Some(id) = self.current {
+                        let note = self.store.get(id);
+                        if note.is_none_or(|n| n.body != self.editor.read(cx).value().as_ref()) {
+                            self.current = note.map(|n| n.id);
+                            self.editor =
+                                paper::editor_state(note.map_or("", |n| n.body.as_str()), w, cx);
+                            self.attach_editor(w, cx);
+                            if self.account.visible {
+                                w.focus(&self.account.focus, cx);
+                            } else if self.searching {
+                                w.focus(&self.query.focus_handle(cx), cx);
+                            }
+                        }
+                    }
+                    self.account.status = upload_error.unwrap_or_else(|| self.sync_status());
+                }
+            }
+        }
+        if self.account.logout_requested {
+            self.logout(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn open_account(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self.save(cx) {
+            self.account.visible = true;
+            if self.store.active_account().is_none() && self.account.requests.is_some() {
+                w.focus(&self.account.email.focus_handle(cx), cx);
+            } else {
+                w.focus(&self.account.focus, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn close_account(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        self.account.visible = false;
+        self.account.password = password_input(w, cx);
+        if self.searching {
+            w.focus(&self.query.focus_handle(cx), cx);
+        } else {
+            w.focus(&self.editor.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn login(&mut self, register: bool, w: &mut Window, cx: &mut Context<Self>) {
+        if self.account.busy || self.account.requests.is_none() {
+            return;
+        }
+        let email = self.account.email.read(cx).value().trim().to_string();
+        let password = self.account.password.read(cx).value().to_string();
+        if email.is_empty() || password.is_empty() {
+            self.account.status = "Enter your email and password.".into();
+        } else {
+            self.account.password = password_input(w, cx);
+            self.account.status = "Connecting…".into();
+            self.request(Request::Login {
+                email,
+                password,
+                register,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(super) fn account_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel = div()
+            .track_focus(&self.account.focus)
+            .mt(px(44.))
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child("Cloud sync")
+                    .child(tool(
+                        "Done",
+                        cx.listener(|s, _, w, cx| s.close_account(w, cx)),
+                    )),
+            );
+        if self.account.requests.is_some() {
+            if self.store.active_account().is_some() {
+                panel = panel.child(tool("Sign out", cx.listener(|s, _, _, cx| s.logout(cx))));
+            } else {
+                panel =
+                    panel
+                        .child(Input::new(&self.account.email))
+                        .child(Input::new(&self.account.password))
+                        .when(self.store.has_local_notes(), |p| {
+                            p.child(div().text_xs().child(
+                                "Signing in moves this Mac’s local notes into your account.",
+                            ))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(tool(
+                                    "Sign in",
+                                    cx.listener(|s, _, w, cx| s.login(false, w, cx)),
+                                ))
+                                .child(tool(
+                                    "Create account",
+                                    cx.listener(|s, _, w, cx| s.login(true, w, cx)),
+                                )),
+                        );
+            }
+        }
+        panel
+            .child(div().text_xs().child(self.account.status.clone()))
+            .into_any_element()
+    }
+}

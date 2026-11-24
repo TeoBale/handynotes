@@ -19,3 +19,22 @@ open target/HandyNotes.app
 ```
 
 You can move the resulting bundle into Applications. For development, run `cargo run --locked` or build the bundle with `scripts/build-app debug`. Run the storage tests with `cargo test --locked`.
+
+## Sync across Macs with Convex
+
+Each Mac connects to the same Convex deployment. Open **Sync** in the top toolbar (or press **Command–comma**), create an account on the first Mac, and sign in with the same email and password on the others. Signing in imports that Mac’s local notes into the account. Signing out returns to the local notebook and keeps the account’s cached notes and pending edits on disk for the next sign-in.
+
+Notes still save locally as you type. While signed in, HandyNotes checks for updates every four seconds and retries after a connection failure. Closing the window keeps sync running. Quitting the app pauses it. If two devices edit the same note, the last upload accepted by Convex wins, including an edit made offline. The **Sync** panel shows connection errors and sync status. Credentials for the session are stored in the macOS login Keychain.
+
+### Connect a deployment
+
+1. From the repository, run `npm ci` and `npx convex dev`. Sign in to Convex and select or create a hosted project. Keep the development command running during setup.
+2. In a second terminal in the same directory, run `npx @convex-dev/auth@0.0.98` and follow the prompts to configure the deployment’s signing keys. This app uses the email/password provider with no browser redirect. For a production deployment, configure auth with `--prod` and publish the functions with `npm run deploy`.
+3. Build the app from the repository. The build reads the public `CONVEX_URL` from your shell, then `.env.local`, then `.env`. Finder launches use that embedded URL. Use the same build on each Mac.
+
+```sh
+scripts/build-app
+open target/HandyNotes.app
+```
+
+For development, `CONVEX_URL=https://YOUR-DEPLOYMENT.convex.cloud cargo run --locked` overrides the built-in URL. Without a deployment URL, HandyNotes runs locally. This version supports password sign-up and sign-in. Email verification and password recovery are not configured.

@@ -10,9 +10,12 @@ use gpui_kit::{
 };
 use store::NoteStore;
 
+mod account;
+mod cloud;
 mod native;
 mod paper;
 mod store;
+mod sync;
 
 struct DeletedNote {
     note: store::Note,
@@ -21,6 +24,7 @@ struct DeletedNote {
 }
 
 struct Notebook {
+    account: account::Account,
     editors: std::collections::HashMap<u64, Entity<EditorState>>,
     deletions: Vec<DeletedNote>,
     store: NoteStore,
@@ -70,8 +74,14 @@ impl Notebook {
                                     window.activate_window();
                                 }
                             }
-                            native::Event::SwipeLeft if !this.searching => this.step(1, window, cx),
-                            native::Event::SwipeRight if !this.searching => {
+                            native::Event::SwipeLeft
+                                if !this.searching && !this.account.visible =>
+                            {
+                                this.step(1, window, cx)
+                            }
+                            native::Event::SwipeRight
+                                if !this.searching && !this.account.visible =>
+                            {
                                 this.step(-1, window, cx)
                             }
                             _ => {}
@@ -89,6 +99,7 @@ impl Notebook {
             false
         });
         let mut this = Self {
+            account: account::Account::new(window, cx),
             editors: Default::default(),
             deletions: Vec::new(),
             store,
@@ -106,6 +117,7 @@ impl Notebook {
             toolbar_visible: false,
         };
         this.attach_editor(window, cx);
+        this.start_sync(window, cx);
         this
     }
 
@@ -218,6 +230,18 @@ impl Notebook {
 
     fn key(&mut self, e: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
+        if self.account.visible {
+            if k.key == "escape" {
+                self.close_account(w, cx);
+            } else if k.key == "enter" && self.store.active_account().is_none() {
+                self.login(false, w, cx);
+            } else {
+                return;
+            }
+            cx.stop_propagation();
+            w.prevent_default();
+            return;
+        }
         match (k.modifiers.platform, k.key.as_str()) {
             (true, "d")
                 if !self.searching
@@ -239,6 +263,7 @@ impl Notebook {
             {
                 self.restore_note(w, cx);
             }
+            (true, ",") => self.open_account(w, cx),
             (true, "f" | "p") => self.search(w, cx),
             (true, "n") => self.open(None, w, cx),
             (true, "w") | (false, "escape") if !self.searching => self.hide(cx),
@@ -490,19 +515,21 @@ impl Render for Notebook {
             .text_color(rgb(0x443e37))
             .relative()
             .capture_action(cx.listener(|this, _: &kit::base::input::Undo, window, cx| {
-                if this.can_restore(cx) {
+                if !this.account.visible && this.can_restore(cx) {
                     this.restore_note(window, cx);
                     cx.stop_propagation();
                 }
             }))
             .capture_key_down(cx.listener(Self::key));
-        view = if self.searching {
+        view = if self.account.visible {
+            view.child(self.account_panel(cx))
+        } else if self.searching {
             view.child(div().h(px(44.)).flex_shrink_0())
                 .child(self.browser(cx))
         } else {
             view.child(paper::paper(&self.editor, self.slide_direction, cx))
         };
-        if self.toolbar_visible {
+        if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};
             let action = |id: &'static str| {
                 div()
@@ -538,6 +565,10 @@ impl Render for Notebook {
                             .flex_1()
                             .on_mouse_down(MouseButton::Left, |_, w, _| w.start_window_move()),
                     )
+                    .child(tool(
+                        "Sync",
+                        cx.listener(|s, _, w, cx| s.open_account(w, cx)),
+                    ))
                     .child(
                         action("search-notes")
                             .child(Icon::new(IconName::Search).size(px(14.)))

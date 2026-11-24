@@ -1,6 +1,35 @@
 use std::{env, path::PathBuf, process::Command};
 
+// Finder launches bundles without the shell environment. Embed only the public
+// deployment URL, with the same local override order as the Convex CLI.
+fn configure_convex_url() {
+    const KEY: &str = "CONVEX_URL";
+    println!("cargo:rerun-if-env-changed={KEY}");
+    let mut url = env::var(KEY).ok();
+    for path in [".env.local", ".env"] {
+        println!("cargo:rerun-if-changed={path}");
+        if url.is_some() || !std::path::Path::new(path).exists() {
+            continue;
+        }
+        for entry in dotenvy::from_path_iter(path).expect("open deployment settings") {
+            let (key, value) = entry.unwrap_or_else(|_| panic!("Invalid dotenv syntax in {path}"));
+            if key == KEY {
+                url = Some(value);
+                break;
+            }
+        }
+    }
+    if let Some(url) = url {
+        assert!(
+            !url.contains(['\r', '\n']),
+            "CONVEX_URL must be a single line"
+        );
+        println!("cargo:rustc-env={KEY}={url}");
+    }
+}
+
 fn main() {
+    configure_convex_url();
     println!("cargo:rerun-if-changed=native/input.m");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
 
