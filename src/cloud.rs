@@ -19,6 +19,28 @@ struct Tokens {
 }
 
 #[derive(Deserialize)]
+pub(crate) struct OAuthStart {
+    redirect: String,
+    pub verifier: String,
+}
+
+impl OAuthStart {
+    pub(crate) fn browser_url(&self) -> Result<url::Url, String> {
+        let url = url::Url::parse(&self.redirect)
+            .map_err(|_| "Convex returned an invalid GitHub sign-in URL.")?;
+        if !is_secure_url(&url)
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/api/auth/signin/github"
+        {
+            return Err("Convex returned an invalid GitHub sign-in URL.".into());
+        }
+        Ok(url)
+    }
+}
+
+#[derive(Deserialize)]
 struct SignInResult {
     tokens: Option<Tokens>,
 }
@@ -81,9 +103,7 @@ impl CloudClient {
     pub(crate) fn new(deployment_url: &str) -> Result<Self, String> {
         let url = url::Url::parse(deployment_url.trim())
             .map_err(|_| "Enter a valid Convex deployment URL.")?;
-        let is_local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-        let secure = url.scheme() == "https" || (is_local && url.scheme() == "http");
-        if !secure
+        if !is_secure_url(&url)
             || url.host_str().is_none()
             || url.path() != "/"
             || !url.username().is_empty()
@@ -116,20 +136,24 @@ impl CloudClient {
             .map(|session| session.account_id.as_str())
     }
 
-    pub(crate) fn sign_in(
+    pub(crate) fn start_github_sign_in(&self, redirect_to: &str) -> Result<OAuthStart, String> {
+        self.call(
+            "action",
+            "auth:signIn",
+            json!({ "provider": "github", "params": { "redirectTo": redirect_to } }),
+            None,
+        )
+    }
+
+    pub(crate) fn complete_github_sign_in(
         &mut self,
-        email: &str,
-        password: &str,
-        sign_up: bool,
+        verifier: &str,
+        code: &str,
     ) -> Result<(), String> {
-        let flow = if sign_up { "signUp" } else { "signIn" };
         let response: SignInResult = self.call(
             "action",
             "auth:signIn",
-            json!({
-                "provider": "password",
-                "params": { "flow": flow, "email": email.trim(), "password": password }
-            }),
+            json!({ "params": { "code": code }, "verifier": verifier }),
             None,
         )?;
         let tokens = response.tokens.ok_or("Convex did not return a session.")?;
@@ -277,29 +301,17 @@ impl CloudClient {
             return serde_json::from_value(value)
                 .map_err(|_| "Convex returned an unexpected response.".into());
         }
-        Err(function_error(path, &body))
+        if path == "auth:signIn" {
+            return Err("Convex could not complete authentication.".into());
+        }
+        Err(format!("Convex could not run {path}."))
     }
 }
 
-fn function_error(path: &str, body: &Value) -> String {
-    let message = body
-        .get("errorMessage")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if path == "auth:signIn" {
-        // Preserve feedback without exposing server stack traces or credentials.
-        if message.contains("InvalidSecret") || message.contains("InvalidAccountId") {
-            return "The email or password is incorrect.".into();
-        }
-        if message.contains("Account") && message.contains("already exists") {
-            return "An account already exists for this email.".into();
-        }
-        if message.contains("Invalid password") {
-            return "Use a password with at least 8 characters.".into();
-        }
-        return "Convex could not complete authentication.".into();
-    }
-    format!("Convex could not run {path}.")
+fn is_secure_url(url: &url::Url) -> bool {
+    url.scheme() == "https"
+        || (url.scheme() == "http"
+            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
 }
 
 #[cfg(target_os = "macos")]

@@ -9,8 +9,6 @@ pub(super) struct Account {
     pub visible: bool,
     focus: FocusHandle,
     logout_requested: bool,
-    email: Entity<InputState>,
-    password: Entity<InputState>,
     requests: Option<async_channel::Sender<Request>>,
     busy: bool,
     status: String,
@@ -19,13 +17,11 @@ pub(super) struct Account {
 }
 
 impl Account {
-    pub fn new(window: &mut Window, cx: &mut Context<Notebook>) -> Self {
+    pub fn new(cx: &mut Context<Notebook>) -> Self {
         Self {
             visible: false,
             focus: cx.focus_handle(),
             logout_requested: false,
-            email: cx.new(|cx| InputState::new(window, cx).placeholder("Email")),
-            password: password_input(window, cx),
             requests: None,
             busy: false,
             status: String::new(),
@@ -33,14 +29,6 @@ impl Account {
             scheduled_sync: None,
         }
     }
-}
-
-fn password_input(window: &mut Window, cx: &mut Context<Notebook>) -> Entity<InputState> {
-    cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder("Password")
-            .masked(true)
-    })
 }
 
 impl Notebook {
@@ -133,8 +121,12 @@ impl Notebook {
     }
 
     fn cloud_event(&mut self, event: Event, w: &mut Window, cx: &mut Context<Self>) {
-        self.account.busy = false;
+        self.account.busy = matches!(&event, Event::OpenBrowser(_));
         match event {
+            Event::OpenBrowser(url) => {
+                self.account.status = "Finish signing in with GitHub in your browser.".into();
+                cx.open_url(&url);
+            }
             Event::Current => self.account.status = self.sync_status(),
             Event::PullFailed {
                 account,
@@ -232,18 +224,13 @@ impl Notebook {
     pub(super) fn open_account(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         if self.save(cx) {
             self.account.visible = true;
-            if self.store.active_account().is_none() && self.account.requests.is_some() {
-                w.focus(&self.account.email.focus_handle(cx), cx);
-            } else {
-                w.focus(&self.account.focus, cx);
-            }
+            w.focus(&self.account.focus, cx);
         }
         cx.notify();
     }
 
     pub(super) fn close_account(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         self.account.visible = false;
-        self.account.password = password_input(w, cx);
         if self.searching {
             w.focus(&self.query.focus_handle(cx), cx);
         } else {
@@ -252,23 +239,12 @@ impl Notebook {
         cx.notify();
     }
 
-    pub(super) fn login(&mut self, register: bool, w: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn login(&mut self, cx: &mut Context<Self>) {
         if self.account.busy || self.account.requests.is_none() {
             return;
         }
-        let email = self.account.email.read(cx).value().trim().to_string();
-        let password = self.account.password.read(cx).value().to_string();
-        if email.is_empty() || password.is_empty() {
-            self.account.status = "Enter your email and password.".into();
-        } else {
-            self.account.password = password_input(w, cx);
-            self.account.status = "Connecting…".into();
-            self.request(Request::Login {
-                email,
-                password,
-                register,
-            });
-        }
+        self.account.status = "Connecting…".into();
+        self.request(Request::Login);
         cx.notify();
     }
 
@@ -296,26 +272,15 @@ impl Notebook {
             } else {
                 panel =
                     panel
-                        .child(Input::new(&self.account.email))
-                        .child(Input::new(&self.account.password))
                         .when(self.store.has_local_notes(), |p| {
                             p.child(div().text_xs().child(
                                 "Signing in moves this Mac’s local notes into your account.",
                             ))
                         })
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(tool(
-                                    "Sign in",
-                                    cx.listener(|s, _, w, cx| s.login(false, w, cx)),
-                                ))
-                                .child(tool(
-                                    "Create account",
-                                    cx.listener(|s, _, w, cx| s.login(true, w, cx)),
-                                )),
-                        );
+                        .child(tool(
+                            "Sign in with GitHub",
+                            cx.listener(|s, _, _, cx| s.login(cx)),
+                        ));
             }
         }
         panel

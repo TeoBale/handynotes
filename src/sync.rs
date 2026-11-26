@@ -1,13 +1,9 @@
 //! Serializes authentication and cloud I/O on a dedicated thread.
-use crate::{cloud::CloudClient, store::CloudNote};
+use crate::{cloud::CloudClient, oauth::Loopback, store::CloudNote};
 use async_channel::{Receiver, Sender};
 
 pub enum Request {
-    Login {
-        email: String,
-        password: String,
-        register: bool,
-    },
+    Login,
     Logout,
     Sync {
         account: String,
@@ -17,6 +13,7 @@ pub enum Request {
 }
 
 pub enum Event {
+    OpenBrowser(String),
     Session {
         account: Option<String>,
         adopt: bool,
@@ -63,16 +60,7 @@ pub fn connect(url: String) -> (Sender<Request>, Receiver<Event>) {
         while let Ok(request) = requests.recv_blocking() {
             let previous_account = account(&client);
             let result = match request {
-                Request::Login {
-                    email,
-                    password,
-                    register,
-                } => client
-                    .sign_in(&email, &password, register)
-                    .map(|_| Event::Session {
-                        account: account(&client),
-                        adopt: true,
-                    }),
+                Request::Login => sign_in(&mut client, &events),
                 Request::Logout => client.sign_out().map(|_| Event::Session {
                     account: None,
                     adopt: false,
@@ -151,4 +139,18 @@ pub fn connect(url: String) -> (Sender<Request>, Receiver<Event>) {
         }
     });
     (tx, rx)
+}
+
+fn sign_in(client: &mut CloudClient, events: &Sender<Event>) -> Result<Event, String> {
+    let callback = Loopback::bind()?;
+    let start = client.start_github_sign_in(callback.url().as_str())?;
+    events
+        .send_blocking(Event::OpenBrowser(start.browser_url()?.into()))
+        .map_err(|_| "The sign-in window was closed.")?;
+    let code = callback.wait_for_code()?;
+    client.complete_github_sign_in(&start.verifier, &code)?;
+    Ok(Event::Session {
+        account: account(client),
+        adopt: true,
+    })
 }

@@ -1,5 +1,5 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
-import { paginationOptsValidator } from "convex/server";
+import { paginationOptsValidator, paginationResultValidator } from "convex/server";
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 
@@ -25,11 +25,7 @@ export const version = query({
 
 export const listPage = query({
   args: { paginationOpts: paginationOptsValidator },
-  returns: v.object({
-    page: v.array(v.object(noteFields)),
-    isDone: v.boolean(),
-    continueCursor: v.string(),
-  }),
+  returns: paginationResultValidator(v.object(noteFields)),
   handler: async (ctx, { paginationOpts }) => {
     const userId = await getAuthUserId(ctx);
     if (!userId) {
@@ -39,14 +35,14 @@ export const listPage = query({
       throw new ConvexError("Page size must be a positive integer");
     }
 
-    const { page, isDone, continueCursor } = await ctx.db
+    const { page, ...pagination } = await ctx.db
       .query("notes")
       .withIndex("by_user_and_key", (index) => index.eq("userId", userId))
       .paginate({
-        cursor: paginationOpts.cursor,
+        ...paginationOpts,
         numItems: Math.min(100, paginationOpts.numItems),
-        maximumRowsRead: 100,
-        maximumBytesRead: 2 * 1024 * 1024,
+        maximumRowsRead: Math.min(100, paginationOpts.maximumRowsRead ?? 100),
+        maximumBytesRead: Math.min(2 * 1024 * 1024, paginationOpts.maximumBytesRead ?? Infinity),
       });
     return {
       page: page.map(({ key, title, body, deleted, updated_at, _creationTime }) => ({
@@ -56,8 +52,7 @@ export const listPage = query({
         deleted,
         updated_at: updated_at ?? Math.floor(_creationTime),
       })),
-      isDone,
-      continueCursor,
+      ...pagination,
     };
   },
 });

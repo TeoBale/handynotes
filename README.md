@@ -20,21 +20,30 @@ open target/HandyNotes.app
 
 You can move the resulting bundle into Applications. For development, run `cargo run --locked` or build the bundle with `scripts/build-app debug`. Run the storage tests with `cargo test --locked`.
 
-## Sync across Macs with Convex
+## Optional sync and web access
 
-Each Mac connects to the same Convex deployment. Open **Account** in the top toolbar (or press **Command–comma**), create an account on the first Mac, and sign in with the same email and password on the others. Signing in imports that Mac’s local notes into the account. Signing out returns to the local notebook and keeps the account’s cached notes and pending edits on disk for the next sign-in.
+HandyNotes works offline without an account. To sync, open **Account** on your Mac (⌘,) and select **Sign in with GitHub**. Finish in your browser and return to HandyNotes. Signing in moves that Mac’s local notebook into the selected account. Signing out returns to the local notebook and keeps the account’s cached notes and pending edits on disk for the next sign-in. Session tokens are stored in the macOS login Keychain.
 
-Notes save locally as you type. Once you sign in, HandyNotes automatically uploads edits and deletions in the background. It checks for updates every four seconds and retries after a connection failure. Closing the window keeps sync running. Quitting the app pauses it. If two devices edit the same note, the last upload accepted by Convex wins, including an edit made offline. The **Account** panel shows connection errors and sync status. Credentials for the session are stored in the macOS login Keychain.
+Notes save locally as you type. When signed in, HandyNotes uploads edits and deletions in the background, checks for updates every four seconds and retries after a connection failure. Closing the window keeps sync running. Quitting pauses it. If two devices edit the same note, the last upload accepted by Convex wins. The **Account** panel shows sync status.
 
-### Connect a deployment
+Sign in to the web app with the same GitHub account to read your synced notes. Search by title or content, then select a result to open it beside the list.
 
-1. From the repository, run `npm ci` and `npx convex dev`. Sign in to Convex and select or create a hosted project. Keep the development command running during setup.
-2. In a second terminal in the same directory, run `npx @convex-dev/auth@0.0.98` and follow the prompts to configure the deployment’s signing keys. This app uses the email/password provider with no browser redirect. For a production deployment, configure auth with `--prod` and publish the functions with `npm run deploy`.
-3. Build the app from the repository. The build reads the public `CONVEX_URL` from your shell, then `.env.local`, then `.env`. Finder launches use that embedded URL. Use the same build on each Mac.
+### Configure GitHub sign-in
+
+1. Run `npm ci` at the repository root. For a new project, select a development deployment with `npx convex dev`.
+2. New deployments need Convex Auth signing keys. Use `npx @convex-dev/auth@0.0.98` to configure them. Keep existing signing keys when upgrading.
+3. Register a GitHub OAuth app with your web origin as the homepage (`http://localhost:5173` for local development). Set the authorization callback URL to the deployment’s **HTTP Actions URL** followed by `/api/auth/callback/github`. Both clients use this callback. Convex returns desktop users to a temporary loopback address on their Mac. [GitHub OAuth app registration](https://github.com/settings/applications/new)
+4. In the Convex deployment’s environment settings, set `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET` to the OAuth app credentials and `SITE_URL` to the web origin. Only the backend needs the client secret. Publish the development functions with `npx convex dev --once`. [Convex GitHub setup guide](https://labs.convex.dev/auth/config/oauth/github)
+5. Build the desktop app with `scripts/build-app`. It reads the public `CONVEX_URL` from your shell, then `.env.local`, then `.env`. Finder launches use the embedded URL. During development, you can override it with `CONVEX_URL=https://YOUR-DEPLOYMENT.convex.cloud cargo run --locked`.
+
+### Run the web app
+
+From the repository root, after `npm ci`:
 
 ```sh
-scripts/build-app
-open target/HandyNotes.app
+cd web
+bun install --frozen-lockfile
+bun run dev --port 5173 --strictPort
 ```
 
-For development, `CONVEX_URL=https://YOUR-DEPLOYMENT.convex.cloud cargo run --locked` overrides the built-in URL. Without a deployment URL, HandyNotes runs locally. This version supports password sign-up and sign-in. Email verification and password recovery are not configured.
+The web app uses the root project’s public `CONVEX_URL`. To override it, set `VITE_CONVEX_URL` in `web/.env.local` or the build environment. Use the web origin configured as `SITE_URL` when opening the app. Run `bun run test` and `bun run build` from `web/`. When serving the production build, configure the host to serve `index.html` for client-side routes such as `/login`.

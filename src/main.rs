@@ -13,6 +13,7 @@ use store::NoteStore;
 mod account;
 mod cloud;
 mod native;
+mod oauth;
 mod paper;
 mod store;
 mod sync;
@@ -99,7 +100,7 @@ impl Notebook {
             false
         });
         let mut this = Self {
-            account: account::Account::new(window, cx),
+            account: account::Account::new(cx),
             editors: Default::default(),
             deletions: Vec::new(),
             store,
@@ -250,7 +251,7 @@ impl Notebook {
             if k.key == "escape" {
                 self.close_account(w, cx);
             } else if k.key == "enter" && self.store.active_account().is_none() {
-                self.login(false, w, cx);
+                self.login(cx);
             } else {
                 return;
             }

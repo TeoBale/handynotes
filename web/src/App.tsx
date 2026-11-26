@@ -1,65 +1,152 @@
 import { useState } from 'react'
-import heroImg from './assets/hero.png'
-import typescriptLogo from './assets/typescript.svg'
-import viteLogo from './assets/vite.svg'
+import { useAuthActions } from '@convex-dev/auth/react'
+import { createRootRoute, createRoute, createRouter, Link, Navigate, Outlet } from '@tanstack/react-router'
+import { Button } from '@ui-sdk/react/button'
+import { useConvexAuth } from 'convex/react'
+import { Notes } from './Notes'
 
-export default function App() {
-  const [count, setCount] = useState(0)
+const rootRoute = createRootRoute({
+  component: AppLayout,
+  notFoundComponent: () => (
+    <main className="message">
+      <h1>Page not found</h1>
+      <Link className="action" to="/">Back to home</Link>
+    </main>
+  ),
+})
 
+const homeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/',
+  component: () => import.meta.env.VITE_CONVEX_URL ? <Home /> : <Welcome />,
+  errorComponent: ({ reset }) => (
+    <main className="message">
+      <h1>Couldn’t load your notes</h1>
+      <p>Check your connection and try again.</p>
+      <Button className="action" onClick={reset}>Try again</Button>
+    </main>
+  ),
+})
+
+const loginRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/login',
+  component: () => import.meta.env.VITE_CONVEX_URL ? <Login /> : (
+    <LoginScreen>
+      <p>Sign-in is unavailable until this site is connected to Convex.</p>
+    </LoginScreen>
+  ),
+})
+
+export const router = createRouter({
+  routeTree: rootRoute.addChildren([homeRoute, loginRoute]),
+})
+
+declare module '@tanstack/react-router' {
+  interface Register {
+    router: typeof router
+  }
+}
+
+function AppLayout() {
   return (
     <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={typescriptLogo} className="framework" alt="TypeScript logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>Edit <code>src/App.tsx</code> and save to test <code>HMR</code></p>
-        </div>
-        <button id="counter" type="button" className="counter" onClick={() => setCount(count + 1)}>
-          Count is {count}
-        </button>
-      </section>
-
-      <div className="ticks" />
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#documentation-icon" /></svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://www.typescriptlang.org" target="_blank">
-                <img className="button-icon" src={typescriptLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true"><use href="/icons.svg#social-icon" /></svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li><a href="https://github.com/vitejs/vite" target="_blank"><svg className="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#github-icon" /></svg>GitHub</a></li>
-            <li><a href="https://chat.vite.dev/" target="_blank"><svg className="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#discord-icon" /></svg>Discord</a></li>
-            <li><a href="https://x.com/vite_js" target="_blank"><svg className="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#x-icon" /></svg>X.com</a></li>
-            <li><a href="https://bsky.app/profile/vite.dev" target="_blank"><svg className="button-icon" role="presentation" aria-hidden="true"><use href="/icons.svg#bluesky-icon" /></svg>Bluesky</a></li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks" />
-      <section id="spacer" />
+      <header className="site-header">
+        <Link className="brand" to="/">
+          <NoteMark />
+          HandyNotes
+        </Link>
+      </header>
+      <Outlet />
     </>
+  )
+}
+
+function NoteMark() {
+  return <span aria-hidden="true" className="note-mark" />
+}
+
+function Home() {
+  const { isLoading, isAuthenticated } = useConvexAuth()
+  if (isLoading) return <main className="message"><p role="status">Checking your session…</p></main>
+  return isAuthenticated ? <Workspace /> : <Welcome />
+}
+
+function Welcome() {
+  return (
+    <main className="message welcome">
+      <NoteMark />
+      <h1>Your notes, at hand.</h1>
+      <p>Find and read the notes you’ve synced from HandyNotes.</p>
+      <Link to="/login" className="action">Sign in</Link>
+    </main>
+  )
+}
+
+function Login() {
+  const { isLoading, isAuthenticated } = useConvexAuth()
+  const { signIn } = useAuthActions()
+  const [error, setError] = useState(false)
+
+  if (isLoading) return <main className="message"><p role="status">Checking your session…</p></main>
+  if (isAuthenticated) return <Navigate to="/" replace />
+
+  return (
+    <LoginScreen>
+      <p>Use your GitHub account to access your synced notes.</p>
+      <Button
+        className="action"
+        pendingAnnouncement="Connecting to GitHub"
+        onClick={async () => {
+          setError(false)
+          try {
+            await signIn('github', { redirectTo: '/' })
+          } catch {
+            setError(true)
+          }
+        }}
+      >
+        Continue with GitHub
+      </Button>
+      {error && <p className="error" role="alert">Couldn’t connect to GitHub. Try again.</p>}
+    </LoginScreen>
+  )
+}
+
+function LoginScreen({ children }: { children: React.ReactNode }) {
+  return (
+    <main className="message">
+      <h1>Sign in to HandyNotes</h1>
+      {children}
+      <Link className="back-link" to="/">Back to home</Link>
+    </main>
+  )
+}
+
+function Workspace() {
+  const { signOut } = useAuthActions()
+  const [error, setError] = useState(false)
+  return (
+    <main className="workspace">
+      <div className="workspace-heading">
+        <h1>Your notes</h1>
+        <Button
+          className="action secondary"
+          pendingAnnouncement="Signing out"
+          onClick={async () => {
+            setError(false)
+            try {
+              await signOut()
+            } catch {
+              setError(true)
+            }
+          }}
+        >
+          Sign out
+        </Button>
+      </div>
+      {error && <p className="error" role="alert">Couldn’t sign out. Try again.</p>}
+      <Notes />
+    </main>
   )
 }
