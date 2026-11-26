@@ -254,6 +254,18 @@ impl Notebook {
             return;
         }
         match (k.modifiers.platform, k.key.as_str()) {
+            (true, "/")
+                if !self.searching
+                    && !k.modifiers.shift
+                    && !k.modifiers.alt
+                    && !k.modifiers.control
+                    && self.editor.focus_handle(cx).is_focused(w) =>
+            {
+                if !e.is_held {
+                    self.editor
+                        .update(cx, |state, cx| paper::toggle_comment(state, w, cx));
+                }
+            }
             (true, "d")
                 if !self.searching
                     && !k.modifiers.shift
@@ -445,8 +457,9 @@ impl Notebook {
                     .on_click(cx.listener(move |this, _, w, cx| this.open(Some(id), w, cx)))
                     .child(
                         div()
-                            .font_family("Menlo")
-                            .text_size(px(13.))
+                            .font_family(paper::NOTE_FONT)
+                            .text_size(paper::NOTE_FONT_SIZE)
+                            .text_color(rgb(paper::INK))
                             .line_height(px(19.))
                             .line_clamp(3)
                             .child(if preview.is_empty() {
@@ -637,6 +650,7 @@ fn main() {
     kit::application()
         .with_assets(kit::assets::Assets)
         .run(move |cx| {
+            paper::register_fonts(cx);
             kit::init(cx);
             Theme::change(ThemeMode::Light, None, cx);
             let bounds = Bounds::centered(None, size(px(480.), px(590.)), cx);

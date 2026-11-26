@@ -7,8 +7,9 @@ case "${1:-release}" in
     *) echo "Usage: scripts/build-app [debug|release]" >&2; exit 2 ;;
 esac
 app="target/HandyNotes.app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "target/$profile/handynotes" "$app/Contents/MacOS/HandyNotes"
 cp native/Info.plist "$app/Contents/Info.plist"
+cp assets/fonts/inter/LICENSE.txt "$app/Contents/Resources/Inter-LICENSE.txt"
 codesign --force --sign - "$app"
 echo "$PWD/$app"
