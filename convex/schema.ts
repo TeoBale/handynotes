@@ -6,6 +6,10 @@ export default defineSchema({
   ...authTables,
   notebookVersions: defineTable({ userId: v.id("users"), version: v.number() })
     .index("by_user", ["userId"]),
+  noteUploadReceipts: defineTable({
+    userId: v.id("users"),
+    operationId: v.string(),
+  }).index("by_user_and_operationId", ["userId", "operationId"]),
   notes: defineTable({
     userId: v.id("users"),
     key: v.string(),
@@ -13,5 +17,6 @@ export default defineSchema({
     body: v.string(),
     deleted: v.boolean(),
     updated_at: v.optional(v.number()),
+    created_at: v.optional(v.number()),
   }).index("by_user_and_key", ["userId", "key"]),
 });

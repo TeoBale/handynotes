@@ -15,6 +15,8 @@ pub struct Note {
     pub body: String,
     pub updated_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     cloud_key: Option<String>,
     #[serde(skip)]
     deleted_from_account: Option<String>,
@@ -28,11 +30,36 @@ pub struct CloudNote {
     pub deleted: bool,
     #[serde(deserialize_with = "timestamp_millis")]
     pub updated_at: u64,
+    #[serde(
+        default,
+        deserialize_with = "optional_timestamp_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub created_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NoteChange {
+    #[serde(flatten)]
+    pub note: CloudNote,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
 }
 
 // Convex serializes integral numbers as JSON floats, including millisecond timestamps.
 fn timestamp_millis<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
-    let millis = f64::deserialize(d)?;
+    parse_timestamp_millis(f64::deserialize(d)?)
+}
+
+fn optional_timestamp_millis<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<u64>, D::Error> {
+    Option::<f64>::deserialize(d)?
+        .map(parse_timestamp_millis)
+        .transpose()
+}
+
+fn parse_timestamp_millis<E: serde::de::Error>(millis: f64) -> Result<u64, E> {
     if millis.fract() == 0.0 && (0.0..=(1_u64 << 53) as f64 - 1.0).contains(&millis) {
         Ok(millis as u64)
     } else {
@@ -43,14 +70,16 @@ fn timestamp_millis<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Er
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct AccountNotes {
     entries: Vec<Note>,
-    outbox: BTreeMap<String, CloudNote>,
+    outbox: BTreeMap<String, NoteChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_adoption: Option<String>,
 }
 
 impl AccountNotes {
-    fn acknowledge(&mut self, sent: &[CloudNote]) {
-        for note in sent {
-            if self.outbox.get(&note.key) == Some(note) {
-                self.outbox.remove(&note.key);
+    fn acknowledge(&mut self, sent: &[NoteChange]) {
+        for change in sent {
+            if self.outbox.get(&change.note.key) == Some(change) {
+                self.outbox.remove(&change.note.key);
             }
         }
     }
@@ -91,20 +120,24 @@ impl Notes {
         if let (Some(account), Some(key)) = (account, &note.cloud_key) {
             self.accounts.get_mut(account).unwrap().outbox.insert(
                 key.clone(),
-                CloudNote {
-                    key: key.clone(),
-                    updated_at: note.updated_at,
-                    title: if deleted {
-                        String::new()
-                    } else {
-                        note.title.clone()
+                NoteChange {
+                    operation_id: Some(Uuid::new_v4().to_string()),
+                    note: CloudNote {
+                        key: key.clone(),
+                        updated_at: note.updated_at,
+                        created_at: note.created_at,
+                        title: if deleted {
+                            String::new()
+                        } else {
+                            note.title.clone()
+                        },
+                        body: if deleted {
+                            String::new()
+                        } else {
+                            note.body.clone()
+                        },
+                        deleted,
                     },
-                    body: if deleted {
-                        String::new()
-                    } else {
-                        note.body.clone()
-                    },
-                    deleted,
                 },
             );
         }
@@ -171,12 +204,35 @@ impl NoteStore {
         !self.notes.entries.is_empty()
     }
 
-    pub fn sign_in(&mut self, account: &str, adopt_local: bool) -> io::Result<()> {
-        if !self.notes.accounts.contains_key(account) || (adopt_local && self.has_local_notes()) {
+    pub fn sign_in(&mut self, account: &str, adoption: Option<&str>) -> io::Result<()> {
+        let cache = self.notes.accounts.get(account);
+        let adoption = adoption
+            .filter(|id| cache.and_then(|notes| notes.completed_adoption.as_deref()) != Some(*id));
+        let needs_upgrade = cache.is_some_and(|notes| {
+            notes
+                .outbox
+                .values()
+                .any(|change| change.operation_id.is_none())
+        });
+        if cache.is_none() || adoption.is_some() || needs_upgrade {
             let mut notes = self.notes.clone();
-            notes.accounts.entry(account.to_owned()).or_default();
-            if adopt_local {
-                for mut note in std::mem::take(&mut notes.entries) {
+            let cache = notes.accounts.entry(account.to_owned()).or_default();
+            for change in cache.outbox.values_mut() {
+                change
+                    .operation_id
+                    .get_or_insert_with(|| Uuid::new_v4().to_string());
+            }
+            if let Some(id) = adoption {
+                let mut local_notes = std::mem::take(&mut notes.entries);
+                local_notes.sort_unstable_by_key(|note| std::cmp::Reverse(note.id));
+                let mut next_created_at = u64::MAX;
+                for mut note in local_notes {
+                    // Legacy files store only the last edit time. Walk the old
+                    // IDs backward to keep their creation order on adoption.
+                    let created_at = *note.created_at.get_or_insert_with(|| {
+                        note.updated_at.min(next_created_at.saturating_sub(1))
+                    });
+                    next_created_at = next_created_at.min(created_at);
                     note.cloud_key = Some(Uuid::new_v4().to_string());
                     notes.queue_change(Some(account), &note, false);
                     notes.entries_mut(Some(account)).push(note);
@@ -184,6 +240,7 @@ impl NoteStore {
                 notes
                     .entries_mut(Some(account))
                     .sort_by_key(|note| std::cmp::Reverse(note.updated_at));
+                notes.accounts.get_mut(account).unwrap().completed_adoption = Some(id.to_owned());
             }
             self.save(notes)?;
         }
@@ -196,7 +253,7 @@ impl NoteStore {
         Ok(())
     }
 
-    pub fn pending(&self) -> Vec<CloudNote> {
+    pub fn pending(&self) -> Vec<NoteChange> {
         self.active_account()
             .map(|account| {
                 self.notes.accounts[account]
@@ -208,7 +265,7 @@ impl NoteStore {
             .unwrap_or_default()
     }
 
-    pub fn acknowledge(&mut self, account: &str, sent: &[CloudNote]) -> io::Result<()> {
+    pub fn acknowledge(&mut self, account: &str, sent: &[NoteChange]) -> io::Result<()> {
         if self.active_account() == Some(account) && !sent.is_empty() {
             let mut notes = self.notes.clone();
             let cache = notes.accounts.get_mut(account).unwrap();
@@ -223,7 +280,7 @@ impl NoteStore {
     pub fn apply_sync(
         &mut self,
         account: &str,
-        sent: &[CloudNote],
+        sent: &[NoteChange],
         remote: Vec<CloudNote>,
     ) -> io::Result<()> {
         if self.active_account() != Some(account) {
@@ -257,6 +314,7 @@ impl NoteStore {
             note.title = remote.title;
             note.body = remote.body;
             note.updated_at = remote.updated_at;
+            note.created_at = remote.created_at.or(note.created_at);
             true
         });
 
@@ -271,6 +329,7 @@ impl NoteStore {
                 title: remote.title,
                 body: remote.body,
                 updated_at: remote.updated_at,
+                created_at: remote.created_at,
                 cloud_key: Some(key),
                 deleted_from_account: None,
             });
@@ -291,6 +350,22 @@ impl NoteStore {
 
     pub fn get(&self, id: u64) -> Option<&Note> {
         self.entries().iter().find(|note| note.id == id)
+    }
+
+    pub fn ids_by_creation(&self) -> Vec<u64> {
+        let mut notes: Vec<_> = self.entries().iter().collect();
+        if self.active_account.is_some() {
+            notes.sort_unstable_by_key(|&note| {
+                (
+                    note.created_at,
+                    note.created_at.is_none().then_some(note.id),
+                    note.cloud_key.as_deref(),
+                )
+            });
+        } else {
+            notes.sort_unstable_by_key(|note| note.id);
+        }
+        notes.into_iter().map(|note| note.id).collect()
     }
 
     pub fn search(&self, query: &str) -> Vec<&Note> {
@@ -316,11 +391,13 @@ impl NoteStore {
         let mut notes = self.notes.clone();
         let account = self.active_account();
         let id = notes.allocate_id()?;
+        let created_at = now();
         let note = Note {
             id,
             title: title.to_owned(),
             body: body.to_owned(),
-            updated_at: now(),
+            updated_at: created_at,
+            created_at: Some(created_at),
             cloud_key: account.map(|_| Uuid::new_v4().to_string()),
             deleted_from_account: None,
         };
@@ -427,12 +504,52 @@ mod tests {
 
     #[test]
     fn decodes_convex_timestamp() {
-        let raw =
-            r#"{"key":"note","body":"x","title":"x","deleted":false,"updated_at":1750000000123.0}"#;
-        assert_eq!(
-            serde_json::from_str::<CloudNote>(raw).unwrap().updated_at,
-            1750000000123
-        );
+        let raw = r#"{"key":"note","body":"x","title":"x","deleted":false,
+            "updated_at":1750000000123.0,"created_at":1750000000000.0}"#;
+        let note = serde_json::from_str::<CloudNote>(raw).unwrap();
+        assert_eq!(note.updated_at, 1750000000123);
+        assert_eq!(note.created_at, Some(1750000000000));
+    }
+
+    #[test]
+    fn persists_upload_ids_for_legacy_outbox_changes() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.json");
+        fs::write(
+            &path,
+            r#"{"next_id":2,"entries":[],"accounts":{"account":{
+                "entries":[{"id":1,"title":"Title","body":"Draft","updated_at":1,"cloud_key":"note"}],
+                "outbox":{"note":{"key":"note","title":"Title","body":"Draft","deleted":false,"updated_at":1}}
+            }}}"#,
+        )?;
+        let mut store = NoteStore::open(&path)?;
+        store.sign_in("account", None)?;
+        let pending = store.pending();
+        assert!(Uuid::parse_str(pending[0].operation_id.as_deref().unwrap()).is_ok());
+        drop(store);
+
+        let mut store = NoteStore::open(&path)?;
+        store.sign_in("account", None)?;
+        assert_eq!(store.pending(), pending);
+        Ok(())
+    }
+
+    #[test]
+    fn old_acknowledgement_preserves_a_restored_note_with_identical_content() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = NoteStore::open(directory.path().join("notes.json"))?;
+        store.sign_in("account", None)?;
+        let id = store.create_with_body("Title", "Draft")?;
+        let sent = store.pending();
+        let deleted = store.delete(id)?;
+        store.restore(&deleted)?;
+        let restored = store.pending();
+
+        assert_eq!(restored[0].note, sent[0].note);
+        assert_ne!(restored[0].operation_id, sent[0].operation_id);
+        store.acknowledge("account", &sent)?;
+        assert_eq!(store.pending(), restored);
+        Ok(())
     }
 
     #[test]
@@ -447,36 +564,132 @@ mod tests {
         assert!(store.has_local_notes());
         assert_eq!(store.get(7).unwrap().body, "Draft");
 
-        store.sign_in("first", false)?;
+        store.sign_in("first", None)?;
         assert!(store.search("").is_empty());
         assert!(store.has_local_notes());
-        store.sign_in("first", true)?;
+        store.sign_in("first", Some("adoption"))?;
         assert_eq!(store.get(7).unwrap().title, "Legacy");
         assert!(!store.has_local_notes());
         let pending = store.pending();
         assert_eq!(pending.len(), 1);
-        assert!(Uuid::parse_str(&pending[0].key).is_ok());
+        assert!(Uuid::parse_str(&pending[0].note.key).is_ok());
         drop(store);
 
         let mut store = NoteStore::open(&path)?;
         assert_eq!(store.active_account(), None);
         assert!(store.search("").is_empty());
-        store.sign_in("second", false)?;
+        store.sign_in("second", None)?;
         assert!(store.pending().is_empty());
         assert!(store.get(7).is_none());
         let second = store.create_with_body("Second", "")?;
         assert_eq!(second, 8);
-        store.apply_sync("first", &pending, pending.clone())?;
+        store.apply_sync("first", &pending, vec![pending[0].note.clone()])?;
         assert_eq!(store.get(second).unwrap().title, "Second");
 
-        store.sign_in("first", false)?;
+        store.sign_in("first", None)?;
         assert_eq!(store.pending(), pending);
         assert!(store.get(second).is_none());
         let deleted = store.delete(7)?;
-        store.sign_in("second", false)?;
+        store.sign_in("second", None)?;
         assert!(store.restore(&deleted).is_err());
         store.sign_out()?;
         assert!(store.search("").is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn retries_interrupted_adoption_across_restarts_without_moving_notes_twice() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.json");
+        let backup = directory.path().join("notes.backup");
+        let mut store = NoteStore::open(&path)?;
+        let draft = store.create_with_body("Draft", "Original local note")?;
+        fs::rename(&path, &backup)?;
+        fs::create_dir(&path)?;
+
+        assert!(store.sign_in("account", Some("adoption")).is_err());
+        assert_eq!(store.active_account(), None);
+        assert_eq!(store.get(draft).unwrap().body, "Original local note");
+        fs::remove_dir(&path)?;
+        fs::rename(backup, &path)?;
+        drop(store);
+
+        let mut store = NoteStore::open(&path)?;
+        store.sign_in("account", Some("adoption"))?;
+        let uploads = store.pending();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(store.get(draft).unwrap().body, "Original local note");
+        store.sign_out()?;
+        let private = store.create_with_body("Private", "New local note")?;
+        drop(store);
+
+        let mut store = NoteStore::open(&path)?;
+        store.sign_in("account", Some("adoption"))?;
+        assert_eq!(store.pending(), uploads);
+        assert!(store.get(private).is_none());
+        store.sign_out()?;
+        assert_eq!(store.get(private).unwrap().body, "New local note");
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_legacy_local_creation_order_on_adoption() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.json");
+        fs::write(
+            &path,
+            r#"{"next_id":3,"entries":[
+                {"id":1,"title":"Older","body":"Edited last","updated_at":3000},
+                {"id":2,"title":"Newer","body":"Edited first","updated_at":2000}
+            ]}"#,
+        )?;
+        let mut store = NoteStore::open(&path)?;
+        assert_eq!(store.ids_by_creation(), vec![1, 2]);
+
+        store.sign_in("account", Some("adoption"))?;
+        assert_eq!(store.ids_by_creation(), vec![1, 2]);
+        assert!(store.get(1).unwrap().created_at < store.get(2).unwrap().created_at);
+        assert!(
+            store
+                .pending()
+                .iter()
+                .all(|change| change.note.created_at.is_some())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn synced_creation_order_survives_different_import_orders_and_edits() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let notes = [
+            ("z-older", 1000, 3000),
+            ("a-same-time", 2000, 2500),
+            ("b-newer", 2000, 2000),
+        ]
+        .map(|(key, created_at, updated_at)| CloudNote {
+            key: key.to_owned(),
+            title: key.to_owned(),
+            body: key.to_owned(),
+            deleted: false,
+            updated_at,
+            created_at: Some(created_at),
+        });
+
+        for (file, initial) in [("one.json", &notes[..0]), ("two.json", &notes[2..])] {
+            let mut store = NoteStore::open(directory.path().join(file))?;
+            store.sign_in("account", None)?;
+            store.apply_sync("account", &[], initial.to_vec())?;
+            store.apply_sync("account", &[], notes.to_vec())?;
+            let ids = store.ids_by_creation();
+            let titles = ids
+                .iter()
+                .map(|&id| store.get(id).unwrap().title.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(titles, ["z-older", "a-same-time", "b-newer"]);
+
+            store.update(ids[0], "Older", "Edited locally")?;
+            assert_eq!(store.ids_by_creation(), ids);
+        }
         Ok(())
     }
 
@@ -485,38 +698,39 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("notes.json");
         let mut store = NoteStore::open(&path)?;
-        store.sign_in("account", true)?;
+        store.sign_in("account", Some("adoption"))?;
         let local = store.create_with_body("Local", "First version")?;
         let sent = store.pending();
         let remote = CloudNote {
             key: "remote-note".to_owned(),
             updated_at: 12345,
+            created_at: None,
             title: "Remote".to_owned(),
             body: "First version".to_owned(),
             deleted: false,
         };
         store.update(local, "Local", "Newer version")?;
-        store.apply_sync("account", &sent, vec![sent[0].clone(), remote.clone()])?;
+        store.apply_sync("account", &sent, vec![sent[0].note.clone(), remote.clone()])?;
         assert_eq!(store.get(local).unwrap().body, "Newer version");
         let remote_id = store.search("remote")[0].id;
         assert_eq!(store.get(remote_id).unwrap().updated_at, 12345);
         let sent = store.pending();
         let deleted = store.delete(local)?;
-        store.apply_sync("account", &sent, vec![sent[0].clone(), remote.clone()])?;
+        store.apply_sync("account", &sent, vec![sent[0].note.clone(), remote.clone()])?;
         assert!(store.get(local).is_none());
-        assert!(store.pending()[0].deleted);
+        assert!(store.pending()[0].note.deleted);
         drop(store);
 
         let mut store = NoteStore::open(&path)?;
-        store.sign_in("account", false)?;
+        store.sign_in("account", None)?;
         let sent = store.pending();
-        assert!(sent[0].deleted);
+        assert!(sent[0].note.deleted);
         store.restore(&deleted)?;
-        store.apply_sync("account", &sent, vec![sent[0].clone(), remote.clone()])?;
+        store.apply_sync("account", &sent, vec![sent[0].note.clone(), remote.clone()])?;
         assert_eq!(store.get(local).unwrap().body, "Newer version");
         let sent = store.pending();
-        assert!(!sent[0].deleted);
-        store.apply_sync("account", &sent, vec![sent[0].clone()])?;
+        assert!(!sent[0].note.deleted);
+        store.apply_sync("account", &sent, vec![sent[0].note.clone()])?;
         assert!(store.pending().is_empty());
         assert!(store.get(remote_id).is_none());
         assert_eq!(store.get(local).unwrap().body, "Newer version");
@@ -528,7 +742,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("notes.json");
         let mut store = NoteStore::open(&path)?;
-        store.sign_in("account", false)?;
+        store.sign_in("account", None)?;
         let edited = store.create_with_body("Edited", "First version")?;
         let unchanged = store.create_with_body("Unchanged", "")?;
         let sent = store.pending();
@@ -537,11 +751,11 @@ mod tests {
         drop(store);
 
         let mut store = NoteStore::open(&path)?;
-        store.sign_in("account", false)?;
+        store.sign_in("account", None)?;
         assert_eq!(store.get(unchanged).unwrap().title, "Unchanged");
         let pending = store.pending();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].body, "Newer version");
+        assert_eq!(pending[0].note.body, "Newer version");
         Ok(())
     }
 

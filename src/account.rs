@@ -1,5 +1,5 @@
 use super::*;
-use crate::sync::{Event, Request};
+use crate::sync::{Event, Request, SessionChange};
 use std::time::Duration;
 
 const SYNC_DELAY: Duration = Duration::from_millis(350);
@@ -13,6 +13,7 @@ pub(super) struct Account {
     busy: bool,
     status: String,
     version: Option<f64>,
+    session_change: Option<SessionChange>,
     scheduled_sync: Option<Task<()>>,
 }
 
@@ -26,6 +27,7 @@ impl Account {
             busy: false,
             status: String::new(),
             version: None,
+            session_change: None,
             scheduled_sync: None,
         }
     }
@@ -56,10 +58,20 @@ impl Notebook {
         })
         .detach();
         let executor = cx.background_executor().clone();
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, cx| {
             loop {
                 executor.timer(POLL_INTERVAL).await;
-                if view.update(cx, |this, _| this.sync_notes()).is_err() {
+                if cx
+                    .update(|w, cx| {
+                        view.update(cx, |this, cx| {
+                            if this.account.session_change.is_some() && !this.account.busy {
+                                this.apply_session_change(w, cx);
+                            }
+                            this.sync_notes();
+                        })
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -102,6 +114,8 @@ impl Notebook {
 
     fn sync_notes(&mut self) {
         if !self.account.busy
+            && !self.account.logout_requested
+            && self.account.session_change.is_none()
             && let Some(account) = self.store.active_account()
         {
             self.request(Request::Sync {
@@ -141,39 +155,10 @@ impl Notebook {
                     .unwrap_or(error);
             }
             Event::Error(message) => self.account.status = message,
-            Event::Session { account, adopt } => {
-                if !self.save(cx) {
-                    cx.notify();
-                    return;
-                }
-                let switching = account.as_deref() != self.store.active_account();
-                let result = match account {
-                    Some(ref owner) => self.store.sign_in(owner, adopt),
-                    None => self.store.sign_out(),
-                };
-                if let Err(error) = result {
-                    self.account.status = error.to_string();
-                } else {
-                    self.account.version = None;
-                    if switching {
-                        self.editors.clear();
-                        self.deletions.clear();
-                        self.searching = false;
-                        self.pending_delete = None;
-                        self.selected = 0;
-                        self.current = None;
-                        self.query.update(cx, |s, cx| s.set_value("", w, cx));
-                        self.editor = paper::editor_state("", w, cx);
-                        self.attach_editor(w, cx);
-                        if self.account.visible {
-                            w.focus(&self.account.focus, cx);
-                        }
-                    }
-                    self.account.status = if account.is_some() {
-                        "Syncing…".into()
-                    } else {
-                        "Saved on this Mac".into()
-                    };
+            Event::Session(change) => {
+                self.account.session_change = Some(change);
+                if !self.account.logout_requested {
+                    self.apply_session_change(w, cx);
                     self.sync_notes();
                 }
             }
@@ -184,40 +169,93 @@ impl Notebook {
                 notes,
                 upload_error,
             } => {
-                if self.store.active_account() != Some(&account) || !self.save(cx) {
-                    cx.notify();
-                    return;
-                }
-                if let Err(error) = self.store.apply_sync(&account, &sent, notes) {
-                    self.account.status = error.to_string();
-                } else {
-                    self.account.version = Some(version);
-                    self.editors.retain(|id, editor| {
-                        self.store
-                            .get(*id)
-                            .is_some_and(|n| n.body == editor.read(cx).value().as_ref())
-                    });
-                    if let Some(id) = self.current {
-                        let note = self.store.get(id);
-                        if note.is_none_or(|n| n.body != self.editor.read(cx).value().as_ref()) {
-                            self.current = note.map(|n| n.id);
-                            self.editor =
-                                paper::editor_state(note.map_or("", |n| n.body.as_str()), w, cx);
-                            self.attach_editor(w, cx);
-                            if self.account.visible {
-                                w.focus(&self.account.focus, cx);
-                            } else if self.searching {
-                                w.focus(&self.query.focus_handle(cx), cx);
+                if self.store.active_account() == Some(&account) && self.save(cx) {
+                    if let Err(error) = self.store.apply_sync(&account, &sent, notes) {
+                        self.account.status = error.to_string();
+                    } else {
+                        self.account.version = Some(version);
+                        self.editors.retain(|id, editor| {
+                            self.store
+                                .get(*id)
+                                .is_some_and(|n| n.body == editor.read(cx).value().as_ref())
+                        });
+                        if let Some(id) = self.current {
+                            let note = self.store.get(id);
+                            if note.is_none_or(|n| n.body != self.editor.read(cx).value().as_ref())
+                            {
+                                self.current = note.map(|n| n.id);
+                                self.editor = paper::editor_state(
+                                    note.map_or("", |n| n.body.as_str()),
+                                    w,
+                                    cx,
+                                );
+                                self.attach_editor(w, cx);
+                                if self.account.visible {
+                                    w.focus(&self.account.focus, cx);
+                                } else if self.searching {
+                                    w.focus(&self.query.focus_handle(cx), cx);
+                                }
                             }
                         }
+                        self.account.status = upload_error.unwrap_or_else(|| self.sync_status());
                     }
-                    self.account.status = upload_error.unwrap_or_else(|| self.sync_status());
                 }
             }
         }
         if self.account.logout_requested {
             self.logout(cx);
         }
+        cx.notify();
+    }
+
+    fn apply_session_change(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(change) = self.account.session_change.take() else {
+            return;
+        };
+        if !self.save(cx) {
+            self.account.status = format!(
+                "{} The account switch will retry.",
+                self.error
+                    .as_deref()
+                    .unwrap_or("Couldn’t save the open note.")
+            );
+            self.account.session_change = Some(change);
+            cx.notify();
+            return;
+        }
+
+        let switching = change.account.as_deref() != self.store.active_account();
+        let result = match &change.account {
+            Some(owner) => self.store.sign_in(owner, change.adoption.as_deref()),
+            None => self.store.sign_out(),
+        };
+        if let Err(error) = result {
+            self.account.status = format!("Couldn’t switch notebooks. Retrying… · {error}");
+            self.account.session_change = Some(change);
+            cx.notify();
+            return;
+        }
+
+        self.account.version = None;
+        if switching {
+            self.editors.clear();
+            self.deletions.clear();
+            self.searching = false;
+            self.pending_delete = None;
+            self.selected = 0;
+            self.current = None;
+            self.query.update(cx, |s, cx| s.set_value("", w, cx));
+            self.editor = paper::editor_state("", w, cx);
+            self.attach_editor(w, cx);
+            if self.account.visible {
+                w.focus(&self.account.focus, cx);
+            }
+        }
+        self.account.status = if change.account.is_some() {
+            "Syncing…".into()
+        } else {
+            "Saved on this Mac".into()
+        };
         cx.notify();
     }
 
@@ -240,7 +278,10 @@ impl Notebook {
     }
 
     pub(super) fn login(&mut self, cx: &mut Context<Self>) {
-        if self.account.busy || self.account.requests.is_none() {
+        if self.account.busy
+            || self.account.requests.is_none()
+            || self.account.session_change.is_some()
+        {
             return;
         }
         self.account.status = "Connecting…".into();
@@ -267,7 +308,13 @@ impl Notebook {
                     )),
             );
         if self.account.requests.is_some() {
-            if self.store.active_account().is_some() {
+            if self.store.active_account().is_some()
+                || self
+                    .account
+                    .session_change
+                    .as_ref()
+                    .is_some_and(|change| change.account.is_some())
+            {
                 panel = panel.child(tool("Sign out", cx.listener(|s, _, _, cx| s.logout(cx))));
             } else {
                 panel =

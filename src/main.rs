@@ -201,14 +201,8 @@ impl Notebook {
         cx.notify();
     }
 
-    fn ids(&self) -> Vec<u64> {
-        let mut ids: Vec<_> = self.store.search("").into_iter().map(|n| n.id).collect();
-        ids.sort_unstable();
-        ids
-    }
-
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.ids();
+        let ids = self.store.ids_by_creation();
         let pos = ids
             .iter()
             .position(|id| Some(*id) == self.current)
@@ -346,6 +340,15 @@ impl Notebook {
             cx.notify();
             return;
         }
+        let next = if self.current == Some(id) && !self.searching {
+            let ids = self.store.ids_by_creation();
+            ids.iter().position(|other| *other == id).and_then(|index| {
+                let (older, current_and_newer) = ids.split_at(index);
+                current_and_newer.get(1).or_else(|| older.last()).copied()
+            })
+        } else {
+            None
+        };
         match self.store.delete(id) {
             Ok(note) => {
                 if self.current == Some(id) {
@@ -356,12 +359,6 @@ impl Notebook {
                     if self.searching {
                         window.focus(&self.query.focus_handle(cx), cx);
                     } else {
-                        let ids = self.ids();
-                        let next = ids
-                            .iter()
-                            .copied()
-                            .find(|other| *other > id)
-                            .or_else(|| ids.last().copied());
                         self.open(next, window, cx);
                     }
                 }

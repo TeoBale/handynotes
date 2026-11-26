@@ -3,8 +3,9 @@ use std::time::Duration;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
-use crate::store::CloudNote;
+use crate::store::{CloudNote, NoteChange};
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.handynotes.cloud";
@@ -16,6 +17,8 @@ const NOTES_PAGE_SIZE: u32 = 100;
 struct Tokens {
     token: String,
     refresh_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_adoption: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +139,19 @@ impl CloudClient {
             .map(|session| session.account_id.as_str())
     }
 
+    pub(crate) fn pending_adoption(&self) -> Option<&str> {
+        self.session.as_ref()?.tokens.pending_adoption.as_deref()
+    }
+
+    pub(crate) fn confirm_adoption(&mut self) {
+        if let Some(session) = &mut self.session
+            && let Some(adoption) = session.tokens.pending_adoption.take()
+            && save_tokens(&self.deployment_url, &session.tokens).is_err()
+        {
+            session.tokens.pending_adoption = Some(adoption);
+        }
+    }
+
     pub(crate) fn start_github_sign_in(&self, redirect_to: &str) -> Result<OAuthStart, String> {
         self.call(
             "action",
@@ -156,7 +172,8 @@ impl CloudClient {
             json!({ "params": { "code": code }, "verifier": verifier }),
             None,
         )?;
-        let tokens = response.tokens.ok_or("Convex did not return a session.")?;
+        let mut tokens = response.tokens.ok_or("Convex did not return a session.")?;
+        tokens.pending_adoption = Some(Uuid::new_v4().to_string());
         let session = Session::new(tokens)?;
         save_tokens(&self.deployment_url, &session.tokens)?;
         self.session = Some(session);
@@ -225,9 +242,9 @@ impl CloudClient {
         }
     }
 
-    pub(crate) fn put(&mut self, note: &CloudNote) -> Result<(), String> {
+    pub(crate) fn put(&mut self, change: &NoteChange) -> Result<(), String> {
         self.refresh_if_needed()?;
-        let args = serde_json::to_value(note).map_err(|_| "Could not encode the note.")?;
+        let args = serde_json::to_value(change).map_err(|_| "Could not encode the note.")?;
         let _: Value = self.call("mutation", "notes:put", args, Some(self.access_token()?))?;
         Ok(())
     }
@@ -254,7 +271,8 @@ impl CloudClient {
             None,
         )?;
         match response.tokens {
-            Some(tokens) => {
+            Some(mut tokens) => {
+                tokens.pending_adoption = session.tokens.pending_adoption.clone();
                 let refreshed = Session::new(tokens)?;
                 if refreshed.account_id != session.account_id {
                     return Err("Convex returned a session for a different account.".into());

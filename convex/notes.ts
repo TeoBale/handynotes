@@ -25,7 +25,7 @@ export const version = query({
 
 export const listPage = query({
   args: { paginationOpts: paginationOptsValidator },
-  returns: paginationResultValidator(v.object(noteFields)),
+  returns: paginationResultValidator(v.object({ ...noteFields, created_at: v.number() })),
   handler: async (ctx, { paginationOpts }) => {
     const userId = await getAuthUserId(ctx);
     if (!userId) {
@@ -45,12 +45,13 @@ export const listPage = query({
         maximumBytesRead: Math.min(2 * 1024 * 1024, paginationOpts.maximumBytesRead ?? Infinity),
       });
     return {
-      page: page.map(({ key, title, body, deleted, updated_at, _creationTime }) => ({
+      page: page.map(({ key, title, body, deleted, updated_at, created_at, _creationTime }) => ({
         key,
         title,
         body,
         deleted,
         updated_at: updated_at ?? Math.floor(_creationTime),
+        created_at: created_at ?? Math.floor(_creationTime),
       })),
       ...pagination,
     };
@@ -58,9 +59,13 @@ export const listPage = query({
 });
 
 export const put = mutation({
-  args: noteFields,
+  args: {
+    ...noteFields,
+    operation_id: v.optional(v.string()),
+    created_at: v.optional(v.number()),
+  },
   returns: v.null(),
-  handler: async (ctx, note) => {
+  handler: async (ctx, { operation_id: operationId, created_at: createdAt, ...note }) => {
     const userId = await getAuthUserId(ctx);
     if (!userId) {
       throw new ConvexError("Sign in to sync your notes");
@@ -68,6 +73,25 @@ export const put = mutation({
 
     if (!Number.isSafeInteger(note.updated_at) || note.updated_at < 0) {
       throw new ConvexError("Invalid note timestamp");
+    }
+    if (createdAt !== undefined && (!Number.isSafeInteger(createdAt) || createdAt < 0)) {
+      throw new ConvexError("Invalid note creation timestamp");
+    }
+
+    if (operationId !== undefined) {
+      if (
+        operationId.length !== 36 ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(operationId)
+      ) {
+        throw new ConvexError("Invalid upload operation ID");
+      }
+      const receipt = await ctx.db.query("noteUploadReceipts")
+        .withIndex("by_user_and_operationId", (index) =>
+          index.eq("userId", userId).eq("operationId", operationId),
+        )
+        .unique();
+      if (receipt) return null;
+      await ctx.db.insert("noteUploadReceipts", { userId, operationId });
     }
 
     const previous = await ctx.db
@@ -80,7 +104,7 @@ export const put = mutation({
     if (previous) {
       await ctx.db.patch(previous._id, note);
     } else {
-      await ctx.db.insert("notes", { ...note, userId });
+      await ctx.db.insert("notes", { ...note, userId, created_at: createdAt });
     }
     const notebook = await ctx.db.query("notebookVersions")
       .withIndex("by_user", q => q.eq("userId", userId)).unique();
