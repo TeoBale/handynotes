@@ -10,9 +10,13 @@ use gpui_kit::{
 };
 use store::NoteStore;
 
+mod account;
+mod cloud;
 mod native;
+mod oauth;
 mod paper;
 mod store;
+mod sync;
 
 struct DeletedNote {
     note: store::Note,
@@ -21,6 +25,7 @@ struct DeletedNote {
 }
 
 struct Notebook {
+    account: account::Account,
     editors: std::collections::HashMap<u64, Entity<EditorState>>,
     deletions: Vec<DeletedNote>,
     store: NoteStore,
@@ -70,8 +75,14 @@ impl Notebook {
                                     window.activate_window();
                                 }
                             }
-                            native::Event::SwipeLeft if !this.searching => this.step(1, window, cx),
-                            native::Event::SwipeRight if !this.searching => {
+                            native::Event::SwipeLeft
+                                if !this.searching && !this.account.visible =>
+                            {
+                                this.step(1, window, cx)
+                            }
+                            native::Event::SwipeRight
+                                if !this.searching && !this.account.visible =>
+                            {
                                 this.step(-1, window, cx)
                             }
                             _ => {}
@@ -89,6 +100,7 @@ impl Notebook {
             false
         });
         let mut this = Self {
+            account: account::Account::new(cx),
             editors: Default::default(),
             deletions: Vec::new(),
             store,
@@ -106,6 +118,7 @@ impl Notebook {
             toolbar_visible: false,
         };
         this.attach_editor(window, cx);
+        this.start_sync(window, cx);
         this
     }
 
@@ -123,7 +136,7 @@ impl Notebook {
         window.focus(&self.editor.focus_handle(cx), cx);
     }
 
-    fn save(&mut self, cx: &App) -> bool {
+    fn save(&mut self, cx: &mut Context<Self>) -> bool {
         let body = self.editor.read(cx).value();
         let title = body
             .lines()
@@ -134,21 +147,37 @@ impl Notebook {
             .trim();
         let title: String = title.chars().take(100).collect();
         let result = match self.current {
-            Some(id) if self.store.get(id).is_some_and(|n| n.body == body.as_ref()) => Ok(()),
+            Some(id) if self.store.get(id).is_some_and(|n| n.body == body.as_ref()) => {
+                self.error = None;
+                return true;
+            }
             Some(id) => self.store.update(id, &title, &body),
-            None if body.is_empty() => Ok(()),
+            None if body.trim().is_empty() => {
+                self.error = None;
+                return true;
+            }
             None => self
                 .store
                 .create_with_body(&title, &body)
                 .map(|id| self.current = Some(id)),
         };
+        if result.is_ok() {
+            self.schedule_sync(cx);
+        }
         self.error = result
             .err()
             .map(|e| format!("Couldn’t save this note · {e}"));
         self.error.is_none()
     }
 
+    fn can_create_note(&self, cx: &App) -> bool {
+        !self.editor.read(cx).value().trim().is_empty()
+    }
+
     fn open(&mut self, id: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
+        if id.is_none() && self.current.is_some() && !self.can_create_note(cx) {
+            return;
+        }
         if !self.save(cx) {
             cx.notify();
             return;
@@ -172,14 +201,8 @@ impl Notebook {
         cx.notify();
     }
 
-    fn ids(&self) -> Vec<u64> {
-        let mut ids: Vec<_> = self.store.search("").into_iter().map(|n| n.id).collect();
-        ids.sort_unstable();
-        ids
-    }
-
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.ids();
+        let ids = self.store.ids_by_creation();
         let pos = ids
             .iter()
             .position(|id| Some(*id) == self.current)
@@ -218,6 +241,18 @@ impl Notebook {
 
     fn key(&mut self, e: &KeyDownEvent, w: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
+        if self.account.visible {
+            if k.key == "escape" {
+                self.close_account(w, cx);
+            } else if k.key == "enter" && self.store.active_account().is_none() {
+                self.login(cx);
+            } else {
+                return;
+            }
+            cx.stop_propagation();
+            w.prevent_default();
+            return;
+        }
         match (k.modifiers.platform, k.key.as_str()) {
             (true, "d")
                 if !self.searching
@@ -239,6 +274,7 @@ impl Notebook {
             {
                 self.restore_note(w, cx);
             }
+            (true, ",") => self.open_account(w, cx),
             (true, "f" | "p") => self.search(w, cx),
             (true, "n") => self.open(None, w, cx),
             (true, "w") | (false, "escape") if !self.searching => self.hide(cx),
@@ -304,6 +340,15 @@ impl Notebook {
             cx.notify();
             return;
         }
+        let next = if self.current == Some(id) && !self.searching {
+            let ids = self.store.ids_by_creation();
+            ids.iter().position(|other| *other == id).and_then(|index| {
+                let (older, current_and_newer) = ids.split_at(index);
+                current_and_newer.get(1).or_else(|| older.last()).copied()
+            })
+        } else {
+            None
+        };
         match self.store.delete(id) {
             Ok(note) => {
                 if self.current == Some(id) {
@@ -314,12 +359,6 @@ impl Notebook {
                     if self.searching {
                         window.focus(&self.query.focus_handle(cx), cx);
                     } else {
-                        let ids = self.ids();
-                        let next = ids
-                            .iter()
-                            .copied()
-                            .find(|other| *other > id)
-                            .or_else(|| ids.last().copied());
                         self.open(next, window, cx);
                     }
                 }
@@ -332,6 +371,7 @@ impl Notebook {
                 self.selected = 0;
                 self.pending_delete = None;
                 self.error = None;
+                self.schedule_sync(cx);
             }
             Err(error) => self.error = Some(format!("Couldn’t delete this note · {error}")),
         }
@@ -347,6 +387,7 @@ impl Notebook {
             Ok(()) => {
                 self.deletions.pop();
                 self.error = None;
+                self.schedule_sync(cx);
                 if !self.searching {
                     self.open(Some(id), window, cx);
                 }
@@ -490,21 +531,23 @@ impl Render for Notebook {
             .text_color(rgb(0x443e37))
             .relative()
             .capture_action(cx.listener(|this, _: &kit::base::input::Undo, window, cx| {
-                if this.can_restore(cx) {
+                if !this.account.visible && this.can_restore(cx) {
                     this.restore_note(window, cx);
                     cx.stop_propagation();
                 }
             }))
             .capture_key_down(cx.listener(Self::key));
-        view = if self.searching {
+        view = if self.account.visible {
+            view.child(self.account_panel(cx))
+        } else if self.searching {
             view.child(div().h(px(44.)).flex_shrink_0())
                 .child(self.browser(cx))
         } else {
             view.child(paper::paper(&self.editor, self.slide_direction, cx))
         };
-        if self.toolbar_visible {
+        if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};
-            let action = |id: &'static str| {
+            let action = |id: &'static str, enabled| {
                 div()
                     .id(id)
                     .flex()
@@ -513,9 +556,12 @@ impl Render for Notebook {
                     .px_2()
                     .h(px(24.))
                     .rounded_md()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0xeeeeec)))
+                    .when(enabled, |s| {
+                        s.cursor_pointer().hover(|s| s.bg(rgb(0xeeeeec)))
+                    })
+                    .when(!enabled, |s| s.opacity(0.35))
             };
+            let can_create_note = self.can_create_note(cx);
             view = view.child(
                 div()
                     .absolute()
@@ -538,16 +584,22 @@ impl Render for Notebook {
                             .flex_1()
                             .on_mouse_down(MouseButton::Left, |_, w, _| w.start_window_move()),
                     )
+                    .child(tool(
+                        "Account",
+                        cx.listener(|s, _, w, cx| s.open_account(w, cx)),
+                    ))
                     .child(
-                        action("search-notes")
+                        action("search-notes", true)
                             .child(Icon::new(IconName::Search).size(px(14.)))
                             .child(div().text_xs().child("⌘F"))
                             .on_click(cx.listener(|s, _, w, cx| s.search(w, cx))),
                     )
                     .child(
-                        action("new-note")
+                        action("new-note", can_create_note)
                             .child(Icon::new(IconName::Plus).size(px(16.)))
-                            .on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx))),
+                            .when(can_create_note, |s| {
+                                s.on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx)))
+                            }),
                     )
                     .with_animation(
                         "toolbar-reveal",
