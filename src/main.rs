@@ -203,7 +203,7 @@ impl Notebook {
     }
 
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.store.ids_by_creation();
+        let ids = self.store.page_ids(self.current);
         let pos = ids
             .iter()
             .position(|id| Some(*id) == self.current)
@@ -358,7 +358,7 @@ impl Notebook {
             return;
         }
         let next = if self.current == Some(id) && !self.searching {
-            let ids = self.store.ids_by_creation();
+            let ids = self.store.page_ids(self.current);
             ids.iter().position(|other| *other == id).and_then(|index| {
                 let (older, current_and_newer) = ids.split_at(index);
                 current_and_newer.get(1).or_else(|| older.last()).copied()

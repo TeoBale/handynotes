@@ -352,8 +352,14 @@ impl NoteStore {
         self.entries().iter().find(|note| note.id == id)
     }
 
-    pub fn ids_by_creation(&self) -> Vec<u64> {
-        let mut notes: Vec<_> = self.entries().iter().collect();
+    pub fn page_ids(&self, current: Option<u64>) -> Vec<u64> {
+        // Keep an open note in place if it is cleared. Once left, the blank
+        // draft is the only empty page in the swipe sequence.
+        let mut notes: Vec<_> = self
+            .entries()
+            .iter()
+            .filter(|note| Some(note.id) == current || !note.body.trim().is_empty())
+            .collect();
         if self.active_account.is_some() {
             notes.sort_unstable_by_key(|&note| {
                 (
@@ -644,10 +650,10 @@ mod tests {
             ]}"#,
         )?;
         let mut store = NoteStore::open(&path)?;
-        assert_eq!(store.ids_by_creation(), vec![1, 2]);
+        assert_eq!(store.page_ids(None), vec![1, 2]);
 
         store.sign_in("account", Some("adoption"))?;
-        assert_eq!(store.ids_by_creation(), vec![1, 2]);
+        assert_eq!(store.page_ids(None), vec![1, 2]);
         assert!(store.get(1).unwrap().created_at < store.get(2).unwrap().created_at);
         assert!(
             store
@@ -680,7 +686,7 @@ mod tests {
             store.sign_in("account", None)?;
             store.apply_sync("account", &[], initial.to_vec())?;
             store.apply_sync("account", &[], notes.to_vec())?;
-            let ids = store.ids_by_creation();
+            let ids = store.page_ids(None);
             let titles = ids
                 .iter()
                 .map(|&id| store.get(id).unwrap().title.as_str())
@@ -688,7 +694,7 @@ mod tests {
             assert_eq!(titles, ["z-older", "a-same-time", "b-newer"]);
 
             store.update(ids[0], "Older", "Edited locally")?;
-            assert_eq!(store.ids_by_creation(), ids);
+            assert_eq!(store.page_ids(None), ids);
         }
         Ok(())
     }
@@ -781,6 +787,27 @@ mod tests {
         let mut store = NoteStore::open(&path)?;
         assert!(store.get(second).is_none());
         assert_ne!(store.create_with_body("", "")?, second);
+        Ok(())
+    }
+
+    #[test]
+    fn blank_saved_notes_do_not_add_pages_to_the_startup_draft() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("notes.json");
+        let mut store = NoteStore::open(&path)?;
+        let older = store.create_with_body("Older", "First page")?;
+        let cleared = store.create_with_body("Cleared", "Temporary text")?;
+        let newer = store.create_with_body("Newer", "Last written page")?;
+        store.update(cleared, "", " \n\t")?;
+        let blank = store.create_with_body("", "")?;
+
+        assert_eq!(store.page_ids(Some(cleared)), vec![older, cleared, newer]);
+        drop(store);
+
+        let store = NoteStore::open(&path)?;
+        assert_eq!(store.page_ids(None), vec![older, newer]);
+        assert!(store.get(cleared).is_some());
+        assert!(store.get(blank).is_some());
         Ok(())
     }
 

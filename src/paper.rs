@@ -270,11 +270,17 @@ fn comment_edit(
 pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl IntoElement {
     let state = &note.state;
     let inset = note.inset.clone();
-    let offset = state.read(cx).scroll_offset().y;
-    if offset < -SCROLL_EPSILON {
+    let editor = state.read(cx);
+    let offset = editor.scroll_offset().y;
+    let top_inset = if editor.text().len() == 0 {
         inset.set(NOTE_MARGIN);
-    }
-    let top_inset = visible_inset(offset, &inset);
+        NOTE_MARGIN
+    } else {
+        if offset < -SCROLL_EPSILON {
+            inset.set(NOTE_MARGIN);
+        }
+        visible_inset(offset, &inset)
+    };
     let scroll_state = state.clone();
     let enter_state = state.clone();
     let backspace_state = state.clone();
@@ -492,19 +498,21 @@ fn scroll_note(
         if !phase.capture() || replaying.get() || !hitbox.should_handle_scroll(window) {
             return;
         }
-        let line_height = editor
-            .read(cx)
-            .line_height()
-            .unwrap_or(window.line_height());
+        let state = editor.read(cx);
+        let line_height = state.line_height().unwrap_or(window.line_height());
         let pixels = event.delta.pixel_delta(line_height);
         if pixels.y == px(0.) || pixels.y.abs() < pixels.x.abs() {
+            return;
+        }
+        let empty = state.text().len() == 0;
+        cx.stop_propagation();
+        if empty {
             return;
         }
         let mut event = event.clone();
         let editor = editor.clone();
         let inset = inset.clone();
         let replaying = replaying.clone();
-        cx.stop_propagation();
         // GPUI restores its mouse listeners after dispatch. Replay then so its
         // editor still handles the gesture phases, momentum and edge behavior.
         window.defer(cx, move |window, cx| {
