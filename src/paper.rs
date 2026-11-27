@@ -42,6 +42,7 @@ const SCROLL_SPEED: f32 = 0.65;
 const SCROLL_EPSILON: Pixels = px(0.001);
 const COMMENT: u32 = 0x525252;
 const LINK: u32 = 0x245a96;
+const MAX_LIST_NUMBER: u32 = 999_999_999;
 const COMPLETED_BOX: u32 = 0x9b60bb;
 const COMMENT_PREFIX: &str = "// ";
 const HEADING_COLORS: [u32; 6] = [
@@ -655,33 +656,42 @@ fn apply_list_action(
     cx: &mut App,
 ) {
     let state = editor.read(cx);
-    let Some((range, replacement)) = list_edit(state.text(), offset, action) else {
+    let Some((range, replacement, caret)) = list_edit(state.text(), offset, action) else {
         return;
     };
-    let cursor = state.cursor();
+    let caret = if matches!(action, ListAction::ToggleCheckbox) {
+        state.cursor()
+    } else {
+        caret
+    };
     editor.update(cx, |state, cx| {
         state.set_selected_range(range, cx);
         state.replace(replacement, window, cx);
-        if matches!(action, ListAction::ToggleCheckbox) {
-            state.set_selected_range(cursor..cursor, cx);
+        if state.cursor() != caret {
+            state.set_selected_range(caret..caret, cx);
         }
     });
     cx.stop_propagation();
 }
 
-fn list_edit(text: &Rope, cursor: usize, action: ListAction) -> Option<(Range<usize>, String)> {
+fn list_edit(
+    text: &Rope,
+    cursor: usize,
+    action: ListAction,
+) -> Option<(Range<usize>, String, usize)> {
     let row = text.offset_to_point(cursor).row;
     let line_start = text.line_start_offset(row);
     let item = list_line(text, row)?;
+    let indent = text.slice(line_start..item.marker.start);
 
-    match action {
+    let (mut range, mut replacement, caret, next_number) = match action {
         ListAction::ToggleCheckbox => {
             let ListKind::Checkbox(completed) = item.kind else {
                 return None;
             };
             let mark = item.marker.start + 1;
             let replacement = if completed { " " } else { "x" };
-            Some((mark..mark + 1, replacement.into()))
+            return Some((mark..mark + 1, replacement.into(), cursor));
         }
         ListAction::Continue if cursor == item.line_end && item.label_start.is_some() => {
             let newline = if item.line_end < text.line_end_offset(row) {
@@ -689,22 +699,94 @@ fn list_edit(text: &Rope, cursor: usize, action: ListAction) -> Option<(Range<us
             } else {
                 "\n"
             };
-            let indent = text.slice(line_start..item.marker.start);
-            let marker = match item.kind {
-                ListKind::Checkbox(_) => "[ ]".to_owned(),
-                ListKind::Bullet => "-".to_owned(),
-                ListKind::Number(999_999_999) => return None,
-                ListKind::Number(number) => format!("{}.", number + 1),
+            let (marker, next_number) = match item.kind {
+                ListKind::Checkbox(_) => ("[ ]".to_owned(), None),
+                ListKind::Bullet => ("-".to_owned(), None),
+                ListKind::Number(MAX_LIST_NUMBER) => return None,
+                ListKind::Number(number) => (format!("{}.", number + 1), Some(number + 2)),
             };
-            Some((cursor..cursor, format!("{newline}{indent}{marker} ")))
+            let replacement = format!("{newline}{indent}{marker} ");
+            let caret = cursor + replacement.len();
+            (cursor..cursor, replacement, caret, next_number)
         }
         ListAction::Continue | ListAction::RemoveEmpty
             if item.label_start.is_none() && cursor == item.line_end =>
         {
-            Some((item.marker.start..item.line_end, String::new()))
+            let next_number = match item.kind {
+                ListKind::Number(number) => Some(number),
+                _ => None,
+            };
+            (
+                item.marker.start..item.line_end,
+                String::new(),
+                item.marker.start,
+                next_number,
+            )
         }
-        _ => None,
+        _ => return None,
+    };
+    if let Some(number) = next_number {
+        range.end = renumber_following_items(
+            text,
+            row,
+            indentation_width(indent.bytes()),
+            number,
+            range.end,
+            &mut replacement,
+        );
     }
+    Some((range, replacement, caret))
+}
+
+fn indentation_width(bytes: impl Iterator<Item = u8>) -> usize {
+    bytes
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .fold(0, |column, byte| {
+            if byte == b'\t' {
+                column + (4 - column % 4)
+            } else {
+                column + 1
+            }
+        })
+}
+
+fn renumber_following_items(
+    text: &Rope,
+    row: usize,
+    indentation: usize,
+    mut number: u32,
+    mut end: usize,
+    replacement: &mut String,
+) -> usize {
+    for row in row + 1..text.lines_len() {
+        let line = text.slice_line(row);
+        if line
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+        {
+            break;
+        }
+        let width = indentation_width(line.bytes());
+        if width > indentation {
+            continue;
+        }
+        if width < indentation || number > MAX_LIST_NUMBER {
+            break;
+        }
+        let Some(item) = list_line(text, row) else {
+            break;
+        };
+        let ListKind::Number(current) = item.kind else {
+            break;
+        };
+        if current != number {
+            replacement.push_str(&text.slice(end..item.marker.start).to_string());
+            replacement.push_str(&format!("{number}."));
+            end = item.marker.end;
+        }
+        number += 1;
+    }
+    end
 }
 
 struct ListLine {
@@ -987,18 +1069,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inserts_in_the_middle_and_renumbers_only_following_siblings() {
+        let original =
+            "7. Ciao\r\n8. Miao\r\n9. Bau\r\n   1. Nested\r\n10. More\r\n\r\n1. Separate";
+        let mut note = Rope::from(original);
+        let cursor = original.find("8. Miao").unwrap() + "8. Miao".len();
+        let (range, replacement, caret) = list_edit(&note, cursor, ListAction::Continue).unwrap();
+        note.replace(range, &replacement);
+        assert_eq!(
+            note.to_string(),
+            "7. Ciao\r\n8. Miao\r\n9. \r\n10. Bau\r\n   1. Nested\r\n11. More\r\n\r\n1. Separate"
+        );
+        assert_eq!(caret, cursor + "\r\n9. ".len());
+
+        let (range, replacement, _) = list_edit(&note, caret, ListAction::RemoveEmpty).unwrap();
+        note.replace(range, &replacement);
+        assert_eq!(
+            note.to_string(),
+            "7. Ciao\r\n8. Miao\r\n\r\n9. Bau\r\n   1. Nested\r\n10. More\r\n\r\n1. Separate"
+        );
+    }
+
+    #[test]
     fn continues_bulleted_and_numbered_lists_and_exits_empty_items() {
         for (original, continued, cleared) in [
             ("  - Café", "  - Café\n  - ", "  - Café\n  "),
             ("\t9. Café", "\t9. Café\n\t10. ", "\t9. Café\n\t"),
         ] {
             let mut note = Rope::from(original);
-            let (range, replacement) = list_edit(&note, note.len(), ListAction::Continue).unwrap();
+            let (range, replacement, _) =
+                list_edit(&note, note.len(), ListAction::Continue).unwrap();
             note.replace(range, &replacement);
             assert_eq!(note.to_string(), continued);
 
             for action in [ListAction::Continue, ListAction::RemoveEmpty] {
-                let (range, replacement) = list_edit(&note, note.len(), action).unwrap();
+                let (range, replacement, _) = list_edit(&note, note.len(), action).unwrap();
                 let mut result = note.clone();
                 result.replace(range, &replacement);
                 assert_eq!(result.to_string(), cleared);
@@ -1017,7 +1122,7 @@ mod tests {
         let note = Rope::from("2. Two\r\nnext");
         assert_eq!(
             list_edit(&note, 6, ListAction::Continue),
-            Some((6..6, "\r\n3. ".into()))
+            Some((6..6, "\r\n3. ".into(), 11))
         );
         assert!(list_edit(&note, 4, ListAction::Continue).is_none());
     }
@@ -1025,12 +1130,12 @@ mod tests {
     #[test]
     fn continues_checkboxes_and_clears_empty_markers() {
         let mut note = Rope::from("\t[x] Café");
-        let (range, replacement) = list_edit(&note, note.len(), ListAction::Continue).unwrap();
+        let (range, replacement, _) = list_edit(&note, note.len(), ListAction::Continue).unwrap();
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "\t[x] Café\n\t[ ] ");
 
         for action in [ListAction::Continue, ListAction::RemoveEmpty] {
-            let (range, replacement) = list_edit(&note, note.len(), action).unwrap();
+            let (range, replacement, _) = list_edit(&note, note.len(), action).unwrap();
             let mut cleared = note.clone();
             cleared.replace(range, &replacement);
             assert_eq!(cleared.to_string(), "\t[x] Café\n\t");
@@ -1050,7 +1155,7 @@ mod tests {
             list_line(&note, 1).unwrap().kind,
             ListKind::Checkbox(false)
         ));
-        let (range, replacement) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
+        let (range, replacement, _) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "// note\n[x] Café /x\n[ ] Next");
 
@@ -1064,7 +1169,7 @@ mod tests {
         assert!(runs[3].1.strikethrough.is_some());
         assert!(runs[4].1.strikethrough.is_none());
 
-        let (range, replacement) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
+        let (range, replacement, _) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "// note\n[ ] Café /x\n[ ] Next");
     }
