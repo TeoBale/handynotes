@@ -3,7 +3,7 @@ use gpui_kit::{
     self as kit,
     component::{
         Theme, ThemeMode,
-        input::{EditorState, Input, InputEvent, InputState},
+        input::{Input, InputEvent, InputState},
     },
     prelude::*,
     *,
@@ -12,7 +12,11 @@ use store::NoteStore;
 
 mod account;
 mod cloud;
+mod list_edit;
+mod markup;
 mod native;
+mod note_edit;
+mod note_scroll;
 mod oauth;
 mod paper;
 mod store;
@@ -26,11 +30,11 @@ struct DeletedNote {
 
 struct Notebook {
     account: account::Account,
-    editors: std::collections::HashMap<u64, Entity<EditorState>>,
+    editors: std::collections::HashMap<u64, paper::NoteEditor>,
     deletions: Vec<DeletedNote>,
     store: NoteStore,
     current: Option<u64>,
-    editor: Entity<EditorState>,
+    editor: paper::NoteEditor,
     query: Entity<InputState>,
     editor_events: Option<Subscription>,
     searching: bool,
@@ -68,7 +72,7 @@ impl Notebook {
                                 cx.notify();
                             }
                             native::Event::Toggle => {
-                                if window.is_window_active() {
+                                if window.is_window_active() && native::is_on_active_space(window) {
                                     this.hide(cx);
                                 } else {
                                     cx.activate(true);
@@ -124,7 +128,7 @@ impl Notebook {
 
     fn attach_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_events = Some(cx.subscribe_in(
-            &self.editor,
+            &self.editor.state,
             window,
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -133,11 +137,11 @@ impl Notebook {
                 }
             },
         ));
-        window.focus(&self.editor.focus_handle(cx), cx);
+        window.focus(&self.editor.state.focus_handle(cx), cx);
     }
 
     fn save(&mut self, cx: &mut Context<Self>) -> bool {
-        let body = self.editor.read(cx).value();
+        let body = self.editor.state.read(cx).value();
         let title = body
             .lines()
             .find(|l| !l.trim().is_empty())
@@ -171,13 +175,10 @@ impl Notebook {
     }
 
     fn can_create_note(&self, cx: &App) -> bool {
-        !self.editor.read(cx).value().trim().is_empty()
+        !self.editor.state.read(cx).value().trim().is_empty()
     }
 
     fn open(&mut self, id: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
-        if id.is_none() && self.current.is_some() && !self.can_create_note(cx) {
-            return;
-        }
         if !self.save(cx) {
             cx.notify();
             return;
@@ -197,12 +198,18 @@ impl Notebook {
             self.attach_editor(window, cx);
         }
         self.searching = false;
-        window.focus(&self.editor.focus_handle(cx), cx);
+        window.focus(&self.editor.state.focus_handle(cx), cx);
         cx.notify();
     }
 
+    fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current.is_none() || self.can_create_note(cx) {
+            self.open(None, window, cx);
+        }
+    }
+
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let ids = self.store.ids_by_creation();
+        let ids = self.store.page_ids(self.current);
         let pos = ids
             .iter()
             .position(|id| Some(*id) == self.current)
@@ -254,6 +261,19 @@ impl Notebook {
             return;
         }
         match (k.modifiers.platform, k.key.as_str()) {
+            (true, "/")
+                if !self.searching
+                    && !k.modifiers.shift
+                    && !k.modifiers.alt
+                    && !k.modifiers.control
+                    && self.editor.state.focus_handle(cx).is_focused(w) =>
+            {
+                if !e.is_held {
+                    self.editor
+                        .state
+                        .update(cx, |state, cx| paper::toggle_comment(state, w, cx));
+                }
+            }
             (true, "d")
                 if !self.searching
                     && !k.modifiers.shift
@@ -276,7 +296,7 @@ impl Notebook {
             }
             (true, ",") => self.open_account(w, cx),
             (true, "f" | "p") => self.search(w, cx),
-            (true, "n") => self.open(None, w, cx),
+            (true, "n") => self.new_note(w, cx),
             (true, "w") | (false, "escape") if !self.searching => self.hide(cx),
             (true, "q") => {
                 if self.save(cx) {
@@ -324,7 +344,10 @@ impl Notebook {
         if self.searching {
             (self.query.entity_id(), self.query.read(cx).value())
         } else {
-            (self.editor.entity_id(), self.editor.read(cx).value())
+            (
+                self.editor.state.entity_id(),
+                self.editor.state.read(cx).value(),
+            )
         }
     }
 
@@ -341,7 +364,7 @@ impl Notebook {
             return;
         }
         let next = if self.current == Some(id) && !self.searching {
-            let ids = self.store.ids_by_creation();
+            let ids = self.store.page_ids(self.current);
             ids.iter().position(|other| *other == id).and_then(|index| {
                 let (older, current_and_newer) = ids.split_at(index);
                 current_and_newer.get(1).or_else(|| older.last()).copied()
@@ -445,8 +468,9 @@ impl Notebook {
                     .on_click(cx.listener(move |this, _, w, cx| this.open(Some(id), w, cx)))
                     .child(
                         div()
-                            .font_family("Menlo")
-                            .text_size(px(13.))
+                            .font_family(paper::NOTE_FONT)
+                            .text_size(paper::NOTE_FONT_SIZE)
+                            .text_color(rgb(paper::INK))
                             .line_height(px(19.))
                             .line_clamp(3)
                             .child(if preview.is_empty() {
@@ -598,7 +622,7 @@ impl Render for Notebook {
                         action("new-note", can_create_note)
                             .child(Icon::new(IconName::Plus).size(px(16.)))
                             .when(can_create_note, |s| {
-                                s.on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx)))
+                                s.on_click(cx.listener(|s, _, w, cx| s.new_note(w, cx)))
                             }),
                     )
                     .with_animation(
@@ -637,7 +661,9 @@ fn main() {
     kit::application()
         .with_assets(kit::assets::Assets)
         .run(move |cx| {
+            paper::register_fonts(cx);
             kit::init(cx);
+            paper::register_language(cx);
             Theme::change(ThemeMode::Light, None, cx);
             let bounds = Bounds::centered(None, size(px(480.), px(590.)), cx);
             kit::open_window(

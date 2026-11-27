@@ -2,6 +2,7 @@
 #import <Carbon/Carbon.h>
 #import <math.h>
 #import <pthread.h>
+#import <stdbool.h>
 #import <stdint.h>
 
 enum {
@@ -35,6 +36,42 @@ static OSStatus handleHotKey(EventHandlerCallRef next, EventRef event, void *con
     return noErr;
 }
 
+typedef NS_ENUM(NSUInteger, ScrollAxis) {
+    ScrollAxisPending,
+    ScrollAxisVertical,
+    ScrollAxisHorizontal,
+};
+
+typedef struct {
+    ScrollAxis axis;
+    CGFloat horizontal;
+    CGFloat verticalTravel;
+    BOOL turnedPage;
+} SwipeGesture;
+
+static int32_t trackSwipe(SwipeGesture *gesture, CGFloat x, CGFloat y) {
+    if (gesture->axis == ScrollAxisVertical || gesture->turnedPage) {
+        return 0;
+    }
+
+    gesture->horizontal += x;
+    if (gesture->axis == ScrollAxisPending) {
+        gesture->verticalTravel += fabs(y);
+        CGFloat horizontal = fabs(gesture->horizontal);
+        if (fmax(horizontal, gesture->verticalTravel) < 6) {
+            return 0;
+        }
+        gesture->axis = horizontal > 1.6 * gesture->verticalTravel
+            ? ScrollAxisHorizontal : ScrollAxisVertical;
+    }
+
+    if (gesture->axis == ScrollAxisHorizontal && fabs(gesture->horizontal) >= 38) {
+        gesture->turnedPage = YES;
+        return gesture->horizontal > 0 ? InputSwipeLeft : InputSwipeRight;
+    }
+    return 0;
+}
+
 static void installSwipeMonitor(void) {
     static id monitor;
     if (monitor != nil) {
@@ -42,45 +79,77 @@ static void installSwipeMonitor(void) {
     }
 
     __block BOOL tracking = NO;
-    __block BOOL handled = NO;
-    __block CGFloat horizontal = 0;
-    __block CGFloat verticalTravel = 0;
+    __block BOOL replaying = NO;
+    __block __weak NSWindow *gestureWindow;
+    __block SwipeGesture gesture = {0};
+    NSMutableArray<NSEvent *> *pending = [NSMutableArray array];
 
     monitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskScrollWheel
         handler:^NSEvent *(NSEvent *event) {
-            if (!event.hasPreciseScrollingDeltas || event.momentumPhase != NSEventPhaseNone) {
+            if (replaying || !event.hasPreciseScrollingDeltas) {
+                return event;
+            }
+
+            NSWindow *window = event.window;
+            NSEventPhase momentum = event.momentumPhase;
+            if (momentum != NSEventPhaseNone) {
+                // The axis stays locked through momentum, even after a page turn.
+                NSWindow *target = window ?: NSApp.keyWindow;
+                if (target != nil && target == gestureWindow) {
+                    if (momentum & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
+                        gestureWindow = nil;
+                    }
+                    return gesture.axis == ScrollAxisVertical ? event : nil;
+                }
                 return event;
             }
 
             NSEventPhase phase = event.phase;
+            if (phase & NSEventPhaseBegan) {
+                tracking = window != nil && window == NSApp.keyWindow;
+                gestureWindow = tracking ? window : nil;
+                gesture = (SwipeGesture){0};
+                [pending removeAllObjects];
+            }
+
+            if (!tracking || window != gestureWindow || window != NSApp.keyWindow) {
+                tracking = NO;
+                [pending removeAllObjects];
+                return event;
+            }
             if (phase & (NSEventPhaseEnded | NSEventPhaseCancelled)) {
                 tracking = NO;
-                return event;
-            }
-            if (phase & NSEventPhaseBegan) {
-                tracking = event.window != nil && event.window == NSApp.keyWindow;
-                handled = NO;
-                horizontal = 0;
-                verticalTravel = 0;
+                [pending removeAllObjects];
+                return gesture.axis == ScrollAxisVertical ? event : nil;
             }
 
-            if (!tracking || event.window == nil || event.window != NSApp.keyWindow) {
-                tracking = NO;
-                return event;
-            }
-            if (handled) {
-                return event;
-            }
-
-            if (phase & (NSEventPhaseBegan | NSEventPhaseChanged)) {
-                // Normalize to the physical direction regardless of the scroll preference.
-                CGFloat delta = event.scrollingDeltaX;
-                horizontal += event.isDirectionInvertedFromDevice ? -delta : delta;
-                verticalTravel += fabs(event.scrollingDeltaY);
-                if (fabs(horizontal) >= 38 && fabs(horizontal) > 1.6 * verticalTravel) {
-                    handled = YES;
-                    deliverEvent(horizontal > 0 ? InputSwipeLeft : InputSwipeRight);
+            // Normalize to the physical direction regardless of the scroll preference.
+            CGFloat x = event.scrollingDeltaX;
+            CGFloat y = event.scrollingDeltaY;
+            int32_t pageTurn = trackSwipe(&gesture, event.isDirectionInvertedFromDevice ? -x : x, y);
+            if (gesture.axis == ScrollAxisHorizontal) {
+                [pending removeAllObjects];
+                if (pageTurn != 0) {
+                    deliverEvent(pageTurn);
                 }
+                return nil;
+            }
+            if (gesture.axis == ScrollAxisPending) {
+                // Hold the initial deltas until the intent is clear, so even a
+                // swipe that starts with vertical drift cannot move the editor.
+                if ((phase & NSEventPhaseBegan) || x != 0 || y != 0) {
+                    [pending addObject:event];
+                }
+                return nil;
+            }
+            if (pending.count != 0) {
+                // Preserve the first deltas and gesture phases for vertical scrolling.
+                replaying = YES;
+                for (NSEvent *buffered in pending) {
+                    [NSApp sendEvent:buffered];
+                }
+                replaying = NO;
+                [pending removeAllObjects];
             }
             return event;
         }];
@@ -142,8 +211,16 @@ int32_t handynotes_input_install(void (*deliver)(int32_t)) {
 - (void)mouseExited:(NSEvent *)event { [self setControlsVisible:NO]; }
 @end
 
-void handynotes_track_toolbar(void *ptr) {
+bool handynotes_window_is_on_active_space(void *ptr) {
     NSView *content = (__bridge NSView *)ptr;
+    return content.window.isOnActiveSpace;
+}
+
+void handynotes_configure_window(void *ptr) {
+    NSView *content = (__bridge NSView *)ptr;
+    NSWindow *window = content.window;
+    window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
+
     const CGFloat height = 40;
     NSRect frame = content.bounds;
     frame.origin.y = content.isFlipped ? NSMinY(frame) : NSMaxY(frame) - height;
@@ -155,6 +232,6 @@ void handynotes_track_toolbar(void *ptr) {
     [region addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
         options:NSTrackingInVisibleRect | NSTrackingActiveAlways | NSTrackingMouseEnteredAndExited
         owner:region userInfo:nil]];
-    NSPoint mouse = [region convertPoint:content.window.mouseLocationOutsideOfEventStream fromView:nil];
+    NSPoint mouse = [region convertPoint:window.mouseLocationOutsideOfEventStream fromView:nil];
     [region setControlsVisible:NSPointInRect(mouse, region.bounds)];
 }
