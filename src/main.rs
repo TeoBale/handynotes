@@ -557,7 +557,7 @@ impl Render for Notebook {
             view.child(div().h(px(44.)).flex_shrink_0())
                 .child(self.browser(cx))
         } else {
-            view.child(paper::paper(&self.editor, self.slide_direction))
+            view.child(paper::paper(&self.editor, self.slide_direction, cx))
         };
         if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, ops::Range, rc::Rc, time::Duration};
+use std::{borrow::Cow, cell::Cell, ops::Range, rc::Rc, time::Duration};
 
 use gpui_kit::base::Scrollbar;
 use gpui_kit::base::input::{AutoClosingPair, Backspace, Enter, set_language_config};
@@ -7,11 +7,13 @@ use gpui_kit::component::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
     RopeExt,
 };
+use gpui_kit::component::{Sizable, Size};
 use gpui_kit::{
     Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
-    HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, div,
-    ease_out_quint, fill, point, px, rgb, size,
+    HighlightStyle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Pixels, PlatformInput, ScrollDelta, ScrollEvent, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, div, ease_out_quint,
+    fill, point, px, rgb, size,
 };
 
 use crate::markup::{self, Format};
@@ -27,6 +29,8 @@ const PAIRS: [(&str, &str); 6] = [
 ];
 const PAPER: u32 = 0xffffff;
 const DOT: u32 = 0xe1eaf3;
+const NOTE_MARGIN: Pixels = px(23.);
+const SCROLL_SPEED: f32 = 0.65;
 const COMMENT: u32 = 0x525252;
 const COMPLETED_BOX: u32 = 0x9b60bb;
 const COMMENT_PREFIX: &str = "// ";
@@ -79,6 +83,8 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<
             .folding(false)
             .auto_close(true)
             .smart_indent(false)
+            // Leave room for the caret when the first-row inset shifts the editor down.
+            .cursor_surrounding_lines(Some(2))
             .searchable(false);
         state.set_scrollbar_renderer(Some(Rc::new(|viewport, _, _| {
             Scrollbar::vertical(&viewport)
@@ -163,7 +169,8 @@ fn comment_edit(
     (replacement != source).then_some((range, replacement, adjusted))
 }
 
-pub fn paper(state: &Entity<EditorState>, direction: Option<isize>) -> impl IntoElement {
+pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) -> impl IntoElement {
+    let top_inset = (NOTE_MARGIN + state.read(cx).scroll_offset().y).clamp(px(0.), NOTE_MARGIN);
     let enter_state = state.clone();
     let backspace_state = state.clone();
     let click_state = state.clone();
@@ -171,9 +178,11 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>) -> impl Into
     let editor = div()
         .id(("note-editor", state.entity_id()))
         .size_full()
-        // Keep the viewport height stable so scrolling doesn't trigger resize-based caret reveal.
-        .pt(px(15.))
-        .pl(px(17.))
+        // Move the viewport without resizing it, which would trigger caret reveal.
+        .relative()
+        .top(top_inset)
+        .pl(NOTE_MARGIN - Size::XSmall.input_px())
+        .pr(px(6.))
         .capture_action(move |action: &Enter, window, cx| {
             if !action.shift {
                 let action = if action.secondary {
@@ -195,6 +204,7 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>) -> impl Into
             Editor::new(state)
                 .aria_label("Note")
                 .appearance(false)
+                .with_size(Size::XSmall)
                 .h(gpui_kit::relative(1.0))
                 .font_family(NOTE_FONT)
                 .text_color(rgb(INK))
@@ -224,8 +234,9 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>) -> impl Into
         .bg(rgb(PAPER))
         .child(
             canvas(
-                |_, _, _| (),
-                |area, (), window, _| {
+                |area, window, _| window.insert_hitbox(area, HitboxBehavior::Normal),
+                |area, hitbox, window, _| {
+                    slow_note_scroll(hitbox, window);
                     let spacing = px(16.);
                     let origin = area.origin;
                     let mut y = px(12.);
@@ -249,6 +260,37 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>) -> impl Into
             .inset_0(),
         )
         .child(editor)
+}
+
+fn slow_note_scroll(hitbox: Hitbox, window: &mut Window) {
+    let replaying = Rc::new(Cell::new(false));
+    window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+        if !phase.capture() || replaying.get() || !hitbox.should_handle_scroll(window) {
+            return;
+        }
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) if delta.y != px(0.) && delta.y.abs() >= delta.x.abs() => {
+                ScrollDelta::Pixels(point(delta.x * SCROLL_SPEED, delta.y * SCROLL_SPEED))
+            }
+            ScrollDelta::Lines(delta) if delta.y != 0. && delta.y.abs() >= delta.x.abs() => {
+                ScrollDelta::Lines(point(delta.x * SCROLL_SPEED, delta.y * SCROLL_SPEED))
+            }
+            _ => return,
+        };
+        let event = ScrollEvent {
+            delta,
+            ..event.clone()
+        };
+        let replaying = replaying.clone();
+        cx.stop_propagation();
+        // GPUI restores its mouse listeners after dispatch. Replay then so its
+        // editor still handles the gesture phases, momentum and edge behavior.
+        window.defer(cx, move |window, cx| {
+            replaying.set(true);
+            window.dispatch_event(PlatformInput::Scroll(event), cx);
+            replaying.set(false);
+        });
+    });
 }
 
 fn edit_selected_text(
