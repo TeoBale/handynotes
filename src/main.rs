@@ -69,7 +69,7 @@ impl Notebook {
                                 cx.notify();
                             }
                             native::Event::Toggle => {
-                                if window.is_window_active() {
+                                if window.is_window_active() && native::is_on_active_space(window) {
                                     this.hide(cx);
                                 } else {
                                     cx.activate(true);

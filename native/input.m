@@ -2,6 +2,7 @@
 #import <Carbon/Carbon.h>
 #import <math.h>
 #import <pthread.h>
+#import <stdbool.h>
 #import <stdint.h>
 
 enum {
@@ -142,8 +143,16 @@ int32_t handynotes_input_install(void (*deliver)(int32_t)) {
 - (void)mouseExited:(NSEvent *)event { [self setControlsVisible:NO]; }
 @end
 
-void handynotes_track_toolbar(void *ptr) {
+bool handynotes_window_is_on_active_space(void *ptr) {
     NSView *content = (__bridge NSView *)ptr;
+    return content.window.isOnActiveSpace;
+}
+
+void handynotes_configure_window(void *ptr) {
+    NSView *content = (__bridge NSView *)ptr;
+    NSWindow *window = content.window;
+    window.collectionBehavior |= NSWindowCollectionBehaviorMoveToActiveSpace;
+
     const CGFloat height = 40;
     NSRect frame = content.bounds;
     frame.origin.y = content.isFlipped ? NSMinY(frame) : NSMaxY(frame) - height;
@@ -155,6 +164,6 @@ void handynotes_track_toolbar(void *ptr) {
     [region addTrackingArea:[[NSTrackingArea alloc] initWithRect:NSZeroRect
         options:NSTrackingInVisibleRect | NSTrackingActiveAlways | NSTrackingMouseEnteredAndExited
         owner:region userInfo:nil]];
-    NSPoint mouse = [region convertPoint:content.window.mouseLocationOutsideOfEventStream fromView:nil];
+    NSPoint mouse = [region convertPoint:window.mouseLocationOutsideOfEventStream fromView:nil];
     [region setControlsVisible:NSPointInRect(mouse, region.bounds)];
 }
