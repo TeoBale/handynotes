@@ -12,6 +12,7 @@ use store::NoteStore;
 
 mod account;
 mod cloud;
+mod markup;
 mod native;
 mod oauth;
 mod paper;
@@ -556,7 +557,7 @@ impl Render for Notebook {
             view.child(div().h(px(44.)).flex_shrink_0())
                 .child(self.browser(cx))
         } else {
-            view.child(paper::paper(&self.editor, self.slide_direction, cx))
+            view.child(paper::paper(&self.editor, self.slide_direction))
         };
         if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};
@@ -652,6 +653,7 @@ fn main() {
         .run(move |cx| {
             paper::register_fonts(cx);
             kit::init(cx);
+            paper::register_language(cx);
             Theme::change(ThemeMode::Light, None, cx);
             let bounds = Bounds::centered(None, size(px(480.), px(590.)), cx);
             kit::open_window(

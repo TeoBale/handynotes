@@ -2693,6 +2693,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "gpui-kit",
+ "markdown",
  "raw-window-handle",
  "security-framework",
  "serde",

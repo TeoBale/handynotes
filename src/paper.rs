@@ -1,18 +1,30 @@
 use std::{borrow::Cow, ops::Range, rc::Rc, time::Duration};
 
 use gpui_kit::base::Scrollbar;
-use gpui_kit::base::input::{Backspace, Enter};
+use gpui_kit::base::input::{AutoClosingPair, Backspace, Enter, set_language_config};
+use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
     RopeExt,
 };
 use gpui_kit::{
     Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
-    HighlightStyle, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, div, ease_out_quint,
-    fill, point, px, rgb, size,
+    HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, div,
+    ease_out_quint, fill, point, px, rgb, size,
 };
 
+use crate::markup::{self, Format};
+
+const NOTE_LANGUAGE: &str = "handynotes-markdown";
+const PAIRS: [(&str, &str); 6] = [
+    ("(", ")"),
+    ("[", "]"),
+    ("{", "}"),
+    ("\"", "\""),
+    ("'", "'"),
+    ("`", "`"),
+];
 const PAPER: u32 = 0xffffff;
 const DOT: u32 = 0xe1eaf3;
 const COMMENT: u32 = 0x525252;
@@ -36,21 +48,36 @@ pub fn register_fonts(cx: &App) {
         .add_fonts(vec![
             Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-Regular.ttf")),
             Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-SemiBold.ttf")),
+            Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-Italic.ttf")),
+            Cow::Borrowed(include_bytes!(
+                "../assets/fonts/inter/Inter-SemiBoldItalic.ttf"
+            )),
+            Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-Bold.ttf")),
+            Cow::Borrowed(include_bytes!("../assets/fonts/inter/Inter-BoldItalic.ttf")),
         ])
         .expect("load bundled Inter fonts");
+}
+
+pub fn register_language(cx: &mut App) {
+    let pairs = PAIRS.map(|(open, close)| AutoClosingPair::new(open, close));
+    set_language_config(
+        NOTE_LANGUAGE,
+        LanguageConfig::default().auto_closing_pairs(pairs),
+        cx,
+    );
 }
 
 pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<EditorState> {
     cx.new(|cx| {
         let mut state = EditorState::new(window, cx)
             .default_value(initial.to_owned())
-            .language("handynotes-markdown")
+            .language(NOTE_LANGUAGE)
             .placeholder("Start writing…")
             .soft_wrap(true)
             .line_number(false)
             .indent_guides(false)
             .folding(false)
-            .auto_close(false)
+            .auto_close(true)
             .smart_indent(false)
             .searchable(false);
         state.set_scrollbar_renderer(Some(Rc::new(|viewport, _, _| {
@@ -136,17 +163,16 @@ fn comment_edit(
     (replacement != source).then_some((range, replacement, adjusted))
 }
 
-pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) -> impl IntoElement {
-    // Account for the editor's built-in line leading and horizontal inset.
-    // Consume the extra first-line space as the document scrolls.
-    let first_line_space = (px(15.) + state.read(cx).scroll_offset().y).clamp(px(0.), px(15.));
+pub fn paper(state: &Entity<EditorState>, direction: Option<isize>) -> impl IntoElement {
     let enter_state = state.clone();
     let backspace_state = state.clone();
     let click_state = state.clone();
+    let key_state = state.clone();
     let editor = div()
         .id(("note-editor", state.entity_id()))
         .size_full()
-        .pt(first_line_space)
+        // Keep the viewport height stable so scrolling doesn't trigger resize-based caret reveal.
+        .pt(px(15.))
         .pl(px(17.))
         .capture_action(move |action: &Enter, window, cx| {
             if !action.shift {
@@ -162,6 +188,9 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) ->
             handle_checkbox_action(&backspace_state, CheckboxAction::RemoveEmpty, window, cx);
         })
         .on_click(move |event, window, cx| toggle_clicked_checkbox(&click_state, event, window, cx))
+        .capture_key_down(move |event, window, cx| {
+            edit_selected_text(&key_state, event, window, cx)
+        })
         .child(
             Editor::new(state)
                 .aria_label("Note")
@@ -220,6 +249,58 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) ->
             .inset_0(),
         )
         .child(editor)
+}
+
+fn edit_selected_text(
+    editor: &Entity<EditorState>,
+    event: &KeyDownEvent,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let state = editor.read(cx);
+    let selection = state.selected_range();
+    let stroke = &event.keystroke;
+    let modifiers = stroke.modifiers;
+    if selection.is_empty() || modifiers.control {
+        return;
+    }
+
+    let edit = if modifiers.platform && !modifiers.alt && !modifiers.shift {
+        let Some(format) = Format::for_key(&stroke.key) else {
+            return;
+        };
+        (!event.is_held)
+            .then(|| markup::format_selection(&state.value(), selection, format))
+            .flatten()
+    } else if !modifiers.platform {
+        let Some((open, close)) = PAIRS
+            .into_iter()
+            .find(|(open, close)| matches!(stroke.key_char.as_deref(), Some(key) if key == *open || key == *close))
+        else {
+            return;
+        };
+        (!event.is_held).then(|| {
+            let selected = state.text().slice(selection.clone());
+            let wrapped = format!("{open}{selected}{close}");
+            let inner = selection.start + open.len()..selection.end + open.len();
+            (selection, wrapped, inner)
+        })
+    } else {
+        return;
+    };
+
+    if let Some((range, replacement, selection)) = edit {
+        let reversed = state.is_selection_reversed();
+        editor.update(cx, |state, cx| {
+            if state.selected_range() != range {
+                state.set_selected_range(range, cx);
+            }
+            state.replace(replacement, window, cx);
+            state.set_selected_range_with_direction(selection, reversed, cx);
+        });
+    }
+    window.prevent_default();
+    cx.stop_propagation();
 }
 
 #[derive(Clone, Copy)]
@@ -373,11 +454,72 @@ fn checkbox_line(text: &Rope, row: usize) -> Option<CheckboxLine> {
 }
 
 #[derive(Default)]
-struct NoteHighlighter(Rope);
+struct NoteHighlighter {
+    text: Rope,
+    inline: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+impl NoteHighlighter {
+    fn new(text: Rope) -> Self {
+        let inline = if text.bytes().any(|byte| matches!(byte, b'*' | b'_' | b'~')) {
+            markup::styles(&text.to_string())
+        } else {
+            Vec::new()
+        };
+        Self { text, inline }
+    }
+
+    fn apply_inline_styles(
+        &self,
+        runs: Vec<(Range<usize>, HighlightStyle)>,
+        range: &Range<usize>,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        let first = self
+            .inline
+            .partition_point(|(span, _)| span.end <= range.start);
+        let mut inline = self.inline[first..].iter().peekable();
+        if inline
+            .peek()
+            .is_none_or(|(span, _)| span.start >= range.end)
+        {
+            return runs;
+        }
+
+        let mut result = Vec::with_capacity(runs.len());
+        for (base, style) in runs {
+            let mut start = base.start;
+            while let Some((span, overlay)) = inline.peek() {
+                if span.start >= base.end {
+                    break;
+                }
+                let overlap_start = start.max(span.start);
+                let overlap_end = base.end.min(span.end);
+                if start < overlap_start {
+                    result.push((start..overlap_start, style));
+                }
+                if overlap_start < overlap_end {
+                    let mut combined = style.highlight(*overlay);
+                    // A completed checkbox already supplies its strike color.
+                    combined.strikethrough = style.strikethrough.or(overlay.strikethrough);
+                    result.push((overlap_start..overlap_end, combined));
+                    start = overlap_end;
+                }
+                if span.end > base.end {
+                    break;
+                }
+                inline.next();
+            }
+            if start < base.end {
+                result.push((start..base.end, style));
+            }
+        }
+        result
+    }
+}
 
 impl InputHighlighter for NoteHighlighter {
     fn language(&self) -> SharedString {
-        "handynotes-markdown".into()
+        NOTE_LANGUAGE.into()
     }
 
     fn update(
@@ -388,7 +530,7 @@ impl InputHighlighter for NoteHighlighter {
         _: &mut Window,
         _: &mut Context<EditorState>,
     ) {
-        self.0 = text.clone();
+        *self = Self::new(text.clone());
     }
 
     fn styles(
@@ -396,7 +538,7 @@ impl InputHighlighter for NoteHighlighter {
         range: &Range<usize>,
         _: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
-        let text = &self.0;
+        let text = &self.text;
         if range.is_empty() || range.end > text.len() {
             return vec![(range.clone(), HighlightStyle::default())];
         }
@@ -463,7 +605,7 @@ impl InputHighlighter for NoteHighlighter {
             }
         }
 
-        runs
+        self.apply_inline_styles(runs, range)
     }
 
     fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
@@ -536,7 +678,7 @@ mod tests {
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "// note\n[x] Café /x\n[ ] Next");
 
-        let highlighter = NoteHighlighter(note.clone());
+        let highlighter = NoteHighlighter::new(note.clone());
         let resolver = InputEditorStyle::default().highlight_styles;
         let runs = highlighter.styles(&(0..note.len()), resolver.as_ref());
         assert_eq!(runs[1].1.color, Some(rgb(COMPLETED_BOX).into()));
@@ -597,7 +739,7 @@ mod tests {
             "See https://example.com\n",
             "#tag",
         );
-        let highlighter = NoteHighlighter(Rope::from(note));
+        let highlighter = NoteHighlighter::new(Rope::from(note));
         let resolver = InputEditorStyle::default().highlight_styles;
         let runs: Vec<_> = highlighter
             .styles(&(0..note.len()), resolver.as_ref())
