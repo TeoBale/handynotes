@@ -1,6 +1,7 @@
-use std::ops::Range;
+use std::{collections::HashMap, ops::Range};
 
 use gpui_kit::{FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, combine_highlights, px};
+use linkify::{LinkFinder, LinkKind};
 use markdown::{ParseOptions, mdast::Node, to_mdast};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,7 +51,7 @@ struct Span {
     content: Range<usize>,
 }
 
-fn spans(text: &str) -> Vec<Span> {
+fn spans(root: &Node) -> Vec<Span> {
     fn collect(node: &Node, spans: &mut Vec<Span>) {
         let format = match node {
             Node::Strong(_) => Some(Format::Bold),
@@ -76,22 +77,102 @@ fn spans(text: &str) -> Vec<Span> {
     }
 
     let mut spans = Vec::new();
-    let mut options = ParseOptions::gfm();
-    options.gfm_strikethrough_single_tilde = false;
-    if let Ok(root) = to_mdast(text, &options) {
-        collect(&root, &mut spans);
-    }
+    collect(root, &mut spans);
     spans
 }
 
-pub fn styles(text: &str) -> Vec<(Range<usize>, HighlightStyle)> {
-    if !text.contains(['*', '_', '~']) {
-        return Vec::new();
+fn parse(text: &str) -> Option<Node> {
+    let mut options = ParseOptions::gfm();
+    options.gfm_strikethrough_single_tilde = false;
+    to_mdast(text, &options).ok()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebLink {
+    pub range: Range<usize>,
+    pub url: String,
+}
+
+pub fn highlights(text: &str) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<WebLink>) {
+    let Some(root) = parse(text) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut definitions = HashMap::new();
+    for node in nodes(&root) {
+        if let Node::Definition(definition) = node {
+            definitions
+                .entry(definition.identifier.as_str())
+                .or_insert(definition.url.as_str());
+        }
     }
-    let spans = spans(text)
+    let mut finder = LinkFinder::new();
+    finder.url_must_have_scheme(false);
+    let mut links = Vec::new();
+    let mut link_end = 0;
+    for node in nodes(&root) {
+        let Some(position) = node.position() else {
+            continue;
+        };
+        let range = position.start.offset..position.end.offset;
+        if range.start < link_end {
+            continue;
+        }
+        let destination = match node {
+            Node::Link(link) => Some(link.url.as_str()),
+            Node::LinkReference(reference) => {
+                definitions.get(reference.identifier.as_str()).copied()
+            }
+            Node::Text(_) => {
+                for candidate in finder.links(&text[range.clone()]) {
+                    if *candidate.kind() != LinkKind::Url || candidate.as_str().contains("://") {
+                        continue;
+                    }
+                    let start = range.start + candidate.start();
+                    if text[..start].ends_with(['@', ':', '/', '\\']) {
+                        continue;
+                    }
+                    let Ok(url) = url::Url::parse(&format!("https://{}", candidate.as_str()))
+                    else {
+                        continue;
+                    };
+                    if url.domain().is_some_and(|domain| domain.contains('.')) {
+                        links.push(WebLink {
+                            range: start..range.start + candidate.end(),
+                            url: url.into(),
+                        });
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        // The label belongs to its Markdown link, even if its destination
+        // cannot be opened. Do not detect a second URL inside that label.
+        link_end = range.end;
+        if let Some(url) = destination.and_then(|destination| url::Url::parse(destination).ok())
+            && matches!(url.scheme(), "http" | "https")
+        {
+            links.push(WebLink {
+                range,
+                url: url.into(),
+            });
+        }
+    }
+    let inline = spans(&root)
         .into_iter()
         .map(|span| (span.content, span.format.style()));
-    combine_highlights(spans, []).collect()
+    (combine_highlights(inline, []).collect(), links)
+}
+
+fn nodes(root: &Node) -> impl Iterator<Item = &Node> {
+    let mut stack = vec![root];
+    std::iter::from_fn(move || {
+        let node = stack.pop()?;
+        if let Some(children) = node.children() {
+            stack.extend(children.iter().rev());
+        }
+        Some(node)
+    })
 }
 
 pub fn format_selection(
@@ -100,7 +181,7 @@ pub fn format_selection(
     format: Format,
 ) -> Option<(Range<usize>, String, Range<usize>)> {
     let selection = trim_selection(text, selection)?;
-    let spans = spans(text);
+    let spans = parse(text).as_ref().map_or_else(Vec::new, spans);
     let delimiter = format.delimiter();
 
     if let Some(span) = matching_span(&spans, &selection, format) {
@@ -205,7 +286,10 @@ mod tests {
             let mut result = text.to_owned();
             result.replace_range(range, &replacement);
             assert_eq!(result, expected);
-            assert_eq!(styles(&result)[0].1.font_style, Some(FontStyle::Italic));
+            assert_eq!(
+                highlights(&result).0[0].1.font_style,
+                Some(FontStyle::Italic)
+            );
 
             let (range, replacement, _) =
                 format_selection(&result, selected, Format::Italic).unwrap();
@@ -247,7 +331,7 @@ mod tests {
     #[test]
     fn styles_markdown_but_skips_escaped_markers_and_code() {
         let text = r"é ***Café*** ~~gone~~ `**code**` \*literal\*";
-        let styles = styles(text);
+        let (styles, _) = highlights(text);
         let (range, emphasis) = styles
             .iter()
             .find(|(range, _)| &text[range.clone()] == "Café")
@@ -262,6 +346,59 @@ mod tests {
             styles
                 .iter()
                 .all(|(range, _)| range.end <= text.find("`").unwrap())
+        );
+    }
+
+    #[test]
+    fn detects_web_links_and_skips_code_and_other_schemes() {
+        let text = concat!(
+            "Café https://example.com, [notes](https://example.org/page), ",
+            "<https://example.net>, [reference][docs], ",
+            "`https://example.io` and [app](custom:action).\n\n",
+            "[docs]: https://example.edu/guide",
+        );
+        let (_, links) = highlights(text);
+        let found: Vec<_> = links
+            .iter()
+            .map(|link| (&text[link.range.clone()], link.url.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("https://example.com", "https://example.com/"),
+                (
+                    "[notes](https://example.org/page)",
+                    "https://example.org/page"
+                ),
+                ("<https://example.net>", "https://example.net/"),
+                ("[reference][docs]", "https://example.edu/guide"),
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_bare_domains_in_prose_without_replacing_markdown_destinations() {
+        let text = concat!(
+            "teobale.dev fsdfsf\nsfsdf www.teobale.dev sdfsdf\n",
+            "Café (docs.example.org/guide), [teobale.dev](https://example.com/), ",
+            "`teobale.dev`, me@teobale.dev, and 1.2.3.",
+        );
+        let (_, links) = highlights(text);
+        let found: Vec<_> = links
+            .iter()
+            .map(|link| (&text[link.range.clone()], link.url.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("teobale.dev", "https://teobale.dev/"),
+                ("www.teobale.dev", "http://www.teobale.dev/"),
+                ("docs.example.org/guide", "https://docs.example.org/guide"),
+                (
+                    "[teobale.dev](https://example.com/)",
+                    "https://example.com/"
+                ),
+            ]
         );
     }
 }

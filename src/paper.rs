@@ -1,4 +1,10 @@
-use std::{borrow::Cow, cell::Cell, ops::Range, rc::Rc, time::Duration};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    ops::Range,
+    rc::Rc,
+    time::Duration,
+};
 
 use gpui_kit::base::input::{
     AutoClosingPair, Backspace, EditorScrollbarContext, Enter, set_language_config,
@@ -6,19 +12,19 @@ use gpui_kit::base::input::{
 use gpui_kit::base::{Scrollbar, ScrollbarHandle};
 use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::input::{
-    Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
-    RopeExt,
+    DisplayPoint, Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit,
+    InputHighlighter, Rope, RopeExt, TextDecoration, TextDecorationCollection,
 };
 use gpui_kit::component::{Sizable, Size};
 use gpui_kit::{
     Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
     HighlightStyle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, deferred, div,
-    ease_out_quint, fill, point, px, rgb, size,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, UnderlineStyle, Window, canvas,
+    combine_highlights, deferred, div, ease_out_quint, fill, font, point, px, rgb, size,
 };
 
-use crate::markup::{self, Format};
+use crate::markup::{self, Format, WebLink};
 
 const NOTE_LANGUAGE: &str = "handynotes-markdown";
 const PAIRS: [(&str, &str); 6] = [
@@ -35,6 +41,7 @@ const NOTE_MARGIN: Pixels = px(23.);
 const SCROLL_SPEED: f32 = 0.65;
 const SCROLL_EPSILON: Pixels = px(0.001);
 const COMMENT: u32 = 0x525252;
+const LINK: u32 = 0x245a96;
 const COMPLETED_BOX: u32 = 0x9b60bb;
 const COMMENT_PREFIX: &str = "// ";
 const HEADING_COLORS: [u32; 6] = [
@@ -78,6 +85,8 @@ pub fn register_language(cx: &mut App) {
 pub struct NoteEditor {
     pub state: Entity<EditorState>,
     inset: Rc<Cell<Pixels>>,
+    links: Rc<RefCell<Vec<WebLink>>>,
+    link_hover: TextDecorationCollection,
 }
 
 #[derive(Clone)]
@@ -134,6 +143,8 @@ fn visible_inset(offset: Pixels, inset: &Cell<Pixels>) -> Pixels {
 pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEditor {
     let inset = Rc::new(Cell::new(NOTE_MARGIN));
     let scrollbar_inset = inset.clone();
+    let links = Rc::new(RefCell::new(Vec::new()));
+    let highlight_links = links.clone();
     let state = cx.new(|cx| {
         let mut state = EditorState::new(window, cx)
             .default_value(initial.to_owned())
@@ -165,10 +176,26 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEdi
             // Draw outside the translated editor's clip with a window-fixed track.
             deferred(scrollbar).into_any_element()
         })));
-        state.set_highlighter_factory(Rc::new(|_| Some(Box::<NoteHighlighter>::default())), cx);
+        state.set_highlighter_factory(
+            Rc::new(move |_| {
+                Some(Box::new(NoteHighlighter::new(
+                    Rope::default(),
+                    highlight_links.clone(),
+                )))
+            }),
+            cx,
+        );
         state
     });
-    NoteEditor { state, inset }
+    let link_hover = state.update(cx, |state, cx| {
+        state.create_decorations_collection(Vec::new(), cx)
+    });
+    NoteEditor {
+        state,
+        inset,
+        links,
+        link_hover,
+    }
 }
 
 pub fn toggle_comment(state: &mut EditorState, window: &mut Window, cx: &mut Context<EditorState>) {
@@ -252,6 +279,11 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
     let backspace_state = state.clone();
     let click_state = state.clone();
     let key_state = state.clone();
+    let click_links = note.links.clone();
+    let hover_links = note.links.clone();
+    let hover_state = state.clone();
+    let link_hover = note.link_hover.clone();
+    let clear_hover = note.link_hover.clone();
     let editor = div()
         .id(("note-editor", state.entity_id()))
         .size_full()
@@ -273,7 +305,42 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
         .capture_action(move |_: &Backspace, window, cx| {
             handle_list_action(&backspace_state, ListAction::RemoveEmpty, window, cx);
         })
-        .on_click(move |event, window, cx| toggle_clicked_checkbox(&click_state, event, window, cx))
+        .on_click(move |event, window, cx| {
+            if let Some(link) =
+                clicked_link(click_state.read(cx), &click_links.borrow(), event, window)
+            {
+                cx.open_url(&link.url);
+            } else {
+                toggle_clicked_checkbox(&click_state, event, window, cx);
+            }
+        })
+        .on_mouse_move(move |event, window, cx| {
+            let links = hover_links.borrow();
+            let hovered = link_at_position(hover_state.read(cx), &links, event.position, window);
+            link_hover.set(
+                hovered
+                    .into_iter()
+                    .map(|link| {
+                        TextDecoration::new(
+                            link.range.clone(),
+                            HighlightStyle {
+                                underline: Some(UnderlineStyle {
+                                    thickness: px(1.),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect(),
+                cx,
+            );
+        })
+        .on_hover(move |hovered, _, cx| {
+            if !hovered {
+                clear_hover.clear(cx);
+            }
+        })
         .capture_key_down(move |event, window, cx| {
             edit_selected_text(&key_state, event, window, cx)
         })
@@ -337,6 +404,80 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
             .inset_0(),
         )
         .child(editor)
+}
+
+fn clicked_link<'a>(
+    state: &EditorState,
+    links: &'a [WebLink],
+    event: &ClickEvent,
+    window: &Window,
+) -> Option<&'a WebLink> {
+    let ClickEvent::Mouse(click) = event else {
+        return None;
+    };
+    let command_only = |modifiers: gpui_kit::Modifiers| {
+        modifiers.platform && !modifiers.shift && !modifiers.alt && !modifiers.control
+    };
+    if click.down.click_count != 1
+        || !command_only(click.down.modifiers)
+        || !command_only(click.up.modifiers)
+        || !state.selected_range().is_empty()
+    {
+        return None;
+    }
+    let link = link_at_position(state, links, click.up.position, window)?;
+    (link_at_position(state, links, click.down.position, window) == Some(link)).then_some(link)
+}
+
+fn link_at_position<'a>(
+    state: &EditorState,
+    links: &'a [WebLink],
+    pointer: Point<Pixels>,
+    window: &Window,
+) -> Option<&'a WebLink> {
+    if links.is_empty() || !state.input_bounds().contains(&pointer) {
+        return None;
+    }
+    let y = pointer.y - state.text_bounds()?.top();
+    let line_height = state.line_height()?;
+    let map = state.display_map();
+    let row = (y / line_height) as usize;
+    if y < px(0.) || row >= map.display_row_count() {
+        return None;
+    }
+    let text = state.text();
+    let start = map.display_pos_to_buffer_pos(DisplayPoint::new(row, 0));
+    if !state.visible_row_range()?.contains(&start.line) {
+        return None;
+    }
+    let row_start = text.line_start_offset(start.line) + start.col;
+    let mut row_end = text.line_end_offset(start.line);
+    if row + 1 < map.display_row_count() {
+        let next = map.display_pos_to_buffer_pos(DisplayPoint::new(row + 1, 0));
+        row_end = row_end.min(text.line_start_offset(next.line) + next.col);
+    }
+    let first = links.partition_point(|link| link.range.end <= row_start);
+    links[first..]
+        .iter()
+        .take_while(|link| link.range.start < row_end)
+        .find(|link| {
+            let range = link.range.start.max(row_start)..link.range.end.min(row_end);
+            // At a soft wrap, the end caret is on the next row. Measure the
+            // final glyph on this row to avoid treating the margin as a link.
+            let right = state.range_to_bounds(&range).and_then(|bounds| {
+                if bounds.size.height == line_height {
+                    return Some(bounds);
+                }
+                let ch = text.chars_at(range.end).reversed().next()?;
+                let last = range.end - ch.len_utf8();
+                let mut bounds = state.range_to_bounds(&(range.start..last))?;
+                let system = window.text_system();
+                let font_id = system.resolve_font(&font(NOTE_FONT));
+                bounds.size.width += system.layout_width(font_id, NOTE_FONT_SIZE, ch);
+                Some(bounds)
+            });
+            right.is_some_and(|bounds| bounds.contains(&pointer))
+        })
 }
 
 fn scroll_note(
@@ -635,16 +776,35 @@ fn list_line(text: &Rope, row: usize) -> Option<ListLine> {
 struct NoteHighlighter {
     text: Rope,
     inline: Vec<(Range<usize>, HighlightStyle)>,
+    links: Rc<RefCell<Vec<WebLink>>>,
 }
 
 impl NoteHighlighter {
-    fn new(text: Rope) -> Self {
-        let inline = if text.bytes().any(|byte| matches!(byte, b'*' | b'_' | b'~')) {
-            markup::styles(&text.to_string())
+    fn new(text: Rope, links: Rc<RefCell<Vec<WebLink>>>) -> Self {
+        let (inline, found) = if text
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'_' | b'~' | b':' | b'.'))
+        {
+            markup::highlights(&text.to_string())
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        Self { text, inline }
+        let link_styles = found.iter().map(|link| {
+            (
+                link.range.clone(),
+                HighlightStyle {
+                    color: Some(rgb(LINK).into()),
+                    ..Default::default()
+                },
+            )
+        });
+        let inline = combine_highlights(inline, link_styles).collect();
+        links.replace(found);
+        Self {
+            text,
+            inline,
+            links,
+        }
     }
 
     fn apply_inline_styles(
@@ -708,7 +868,7 @@ impl InputHighlighter for NoteHighlighter {
         _: &mut Window,
         _: &mut Context<EditorState>,
     ) {
-        *self = Self::new(text.clone());
+        *self = Self::new(text.clone(), self.links.clone());
     }
 
     fn styles(
@@ -894,7 +1054,7 @@ mod tests {
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "// note\n[x] Café /x\n[ ] Next");
 
-        let highlighter = NoteHighlighter::new(note.clone());
+        let highlighter = NoteHighlighter::new(note.clone(), Rc::default());
         let resolver = InputEditorStyle::default().highlight_styles;
         let runs = highlighter.styles(&(0..note.len()), resolver.as_ref());
         assert_eq!(runs[1].1.color, Some(rgb(COMPLETED_BOX).into()));
@@ -955,7 +1115,7 @@ mod tests {
             "See https://example.com\n",
             "#tag",
         );
-        let highlighter = NoteHighlighter::new(Rope::from(note));
+        let highlighter = NoteHighlighter::new(Rope::from(note), Rc::default());
         let resolver = InputEditorStyle::default().highlight_styles;
         let runs: Vec<_> = highlighter
             .styles(&(0..note.len()), resolver.as_ref())
@@ -975,7 +1135,9 @@ mod tests {
                 ("#### Sage\n", Some(rgb(HEADING_COLORS[3]).into())),
                 ("##### Teal\n", Some(rgb(HEADING_COLORS[4]).into())),
                 ("###### Lavender\n", Some(rgb(HEADING_COLORS[5]).into())),
-                ("See https://example.com\n", None),
+                ("See ", None),
+                ("https://example.com", Some(rgb(LINK).into())),
+                ("\n", None),
                 ("#tag", None),
             ]
         );
