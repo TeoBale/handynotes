@@ -536,7 +536,7 @@ fn tool(
 }
 
 impl Render for Notebook {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut view = div()
             .size_full()
             .flex()
@@ -557,7 +557,7 @@ impl Render for Notebook {
             view.child(div().h(px(44.)).flex_shrink_0())
                 .child(self.browser(cx))
         } else {
-            view.child(paper::paper(&self.editor, self.slide_direction, cx))
+            view.child(paper::paper(&self.editor, self.slide_direction, window, cx))
         };
         if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};

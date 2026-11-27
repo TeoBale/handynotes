@@ -31,6 +31,7 @@ const PAPER: u32 = 0xffffff;
 const DOT: u32 = 0xe1eaf3;
 const NOTE_MARGIN: Pixels = px(23.);
 const SCROLL_SPEED: f32 = 0.65;
+const SCROLL_EPSILON: Pixels = px(0.001);
 const COMMENT: u32 = 0x525252;
 const COMPLETED_BOX: u32 = 0x9b60bb;
 const COMMENT_PREFIX: &str = "// ";
@@ -169,8 +170,22 @@ fn comment_edit(
     (replacement != source).then_some((range, replacement, adjusted))
 }
 
-pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) -> impl IntoElement {
-    let top_inset = (NOTE_MARGIN + state.read(cx).scroll_offset().y).clamp(px(0.), NOTE_MARGIN);
+pub fn paper(
+    state: &Entity<EditorState>,
+    direction: Option<isize>,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let inset = window.use_keyed_state(("note-inset", state.entity_id()), cx, |_, _| {
+        Cell::new(NOTE_MARGIN)
+    });
+    let top_inset = if state.read(cx).scroll_offset().y < -SCROLL_EPSILON {
+        inset.read(cx).set(NOTE_MARGIN);
+        px(0.)
+    } else {
+        inset.read(cx).get()
+    };
+    let scroll_state = state.clone();
     let enter_state = state.clone();
     let backspace_state = state.clone();
     let click_state = state.clone();
@@ -235,8 +250,8 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) ->
         .child(
             canvas(
                 |area, window, _| window.insert_hitbox(area, HitboxBehavior::Normal),
-                |area, hitbox, window, _| {
-                    slow_note_scroll(hitbox, window);
+                move |area, hitbox, window, _| {
+                    scroll_note(hitbox, scroll_state, inset, window);
                     let spacing = px(16.);
                     let origin = area.origin;
                     let mut y = px(12.);
@@ -262,30 +277,65 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) ->
         .child(editor)
 }
 
-fn slow_note_scroll(hitbox: Hitbox, window: &mut Window) {
+fn scroll_note(
+    hitbox: Hitbox,
+    editor: Entity<EditorState>,
+    inset: Entity<Cell<Pixels>>,
+    window: &mut Window,
+) {
     let replaying = Rc::new(Cell::new(false));
     window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
         if !phase.capture() || replaying.get() || !hitbox.should_handle_scroll(window) {
             return;
         }
-        let delta = match event.delta {
-            ScrollDelta::Pixels(delta) if delta.y != px(0.) && delta.y.abs() >= delta.x.abs() => {
-                ScrollDelta::Pixels(point(delta.x * SCROLL_SPEED, delta.y * SCROLL_SPEED))
-            }
-            ScrollDelta::Lines(delta) if delta.y != 0. && delta.y.abs() >= delta.x.abs() => {
-                ScrollDelta::Lines(point(delta.x * SCROLL_SPEED, delta.y * SCROLL_SPEED))
-            }
-            _ => return,
-        };
-        let event = ScrollEvent {
-            delta,
-            ..event.clone()
-        };
+        let line_height = editor
+            .read(cx)
+            .line_height()
+            .unwrap_or(window.line_height());
+        let pixels = event.delta.pixel_delta(line_height);
+        if pixels.y == px(0.) || pixels.y.abs() < pixels.x.abs() {
+            return;
+        }
+        let mut event = event.clone();
+        let editor = editor.clone();
+        let inset = inset.clone();
         let replaying = replaying.clone();
         cx.stop_propagation();
         // GPUI restores its mouse listeners after dispatch. Replay then so its
         // editor still handles the gesture phases, momentum and edge behavior.
         window.defer(cx, move |window, cx| {
+            let offset = editor.read(cx).scroll_offset().y;
+            let old_inset = if offset < -SCROLL_EPSILON {
+                px(0.)
+            } else {
+                inset.read(cx).get()
+            };
+            let travel = pixels.y * SCROLL_SPEED;
+            // Scroll through the blank inset before scrolling text into the clip.
+            let inset_travel = if travel < px(0.) {
+                travel
+            } else {
+                (offset + travel).max(px(0.))
+            };
+            let new_inset = (old_inset + inset_travel).clamp(px(0.), NOTE_MARGIN);
+            if new_inset != old_inset {
+                inset.read(cx).set(new_inset);
+                window.refresh();
+            }
+            let remaining = travel - (new_inset - old_inset);
+            let factor = if remaining.abs() < SCROLL_EPSILON {
+                0.
+            } else {
+                remaining / pixels.y
+            };
+            event.delta = match event.delta {
+                ScrollDelta::Pixels(delta) => {
+                    ScrollDelta::Pixels(point(delta.x * factor, delta.y * factor))
+                }
+                ScrollDelta::Lines(delta) => {
+                    ScrollDelta::Lines(point(delta.x * factor, delta.y * factor))
+                }
+            };
             replaying.set(true);
             window.dispatch_event(PlatformInput::Scroll(event), cx);
             replaying.set(false);
