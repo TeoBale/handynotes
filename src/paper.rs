@@ -263,15 +263,15 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
         .capture_action(move |action: &Enter, window, cx| {
             if !action.shift {
                 let action = if action.secondary {
-                    CheckboxAction::Toggle
+                    ListAction::ToggleCheckbox
                 } else {
-                    CheckboxAction::Continue
+                    ListAction::Continue
                 };
-                handle_checkbox_action(&enter_state, action, window, cx);
+                handle_list_action(&enter_state, action, window, cx);
             }
         })
         .capture_action(move |_: &Backspace, window, cx| {
-            handle_checkbox_action(&backspace_state, CheckboxAction::RemoveEmpty, window, cx);
+            handle_list_action(&backspace_state, ListAction::RemoveEmpty, window, cx);
         })
         .on_click(move |event, window, cx| toggle_clicked_checkbox(&click_state, event, window, cx))
         .capture_key_down(move |event, window, cx| {
@@ -450,21 +450,21 @@ fn edit_selected_text(
 }
 
 #[derive(Clone, Copy)]
-enum CheckboxAction {
+enum ListAction {
     Continue,
     RemoveEmpty,
-    Toggle,
+    ToggleCheckbox,
 }
 
-fn handle_checkbox_action(
+fn handle_list_action(
     editor: &Entity<EditorState>,
-    action: CheckboxAction,
+    action: ListAction,
     window: &mut Window,
     cx: &mut App,
 ) {
     let selection = editor.read(cx).selected_range();
     if selection.is_empty() {
-        apply_checkbox_action(editor, selection.start, action, window, cx);
+        apply_list_action(editor, selection.start, action, window, cx);
     }
 }
 
@@ -490,110 +490,142 @@ fn toggle_clicked_checkbox(
     }
     let marker = state.visible_row_range().and_then(|mut rows| {
         rows.find_map(|row| {
-            let checkbox = checkbox_line(state.text(), row)?;
-            let bounds = state.range_to_bounds(&checkbox.marker)?;
+            let item = list_line(state.text(), row)?;
+            if !matches!(item.kind, ListKind::Checkbox(_)) {
+                return None;
+            }
+            let bounds = state.range_to_bounds(&item.marker)?;
             (Some(bounds.size.height) == state.line_height()
                 && bounds.contains(&click.down.position)
                 && bounds.contains(&click.up.position))
-            .then_some(checkbox.marker.start)
+            .then_some(item.marker.start)
         })
     });
     if let Some(offset) = marker {
-        apply_checkbox_action(editor, offset, CheckboxAction::Toggle, window, cx);
+        apply_list_action(editor, offset, ListAction::ToggleCheckbox, window, cx);
     }
 }
 
-fn apply_checkbox_action(
+fn apply_list_action(
     editor: &Entity<EditorState>,
     offset: usize,
-    action: CheckboxAction,
+    action: ListAction,
     window: &mut Window,
     cx: &mut App,
 ) {
     let state = editor.read(cx);
-    let Some((range, replacement)) = checkbox_edit(state.text(), offset, action) else {
+    let Some((range, replacement)) = list_edit(state.text(), offset, action) else {
         return;
     };
     let cursor = state.cursor();
     editor.update(cx, |state, cx| {
         state.set_selected_range(range, cx);
         state.replace(replacement, window, cx);
-        if matches!(action, CheckboxAction::Toggle) {
+        if matches!(action, ListAction::ToggleCheckbox) {
             state.set_selected_range(cursor..cursor, cx);
         }
     });
     cx.stop_propagation();
 }
 
-fn checkbox_edit(
-    text: &Rope,
-    cursor: usize,
-    action: CheckboxAction,
-) -> Option<(Range<usize>, String)> {
+fn list_edit(text: &Rope, cursor: usize, action: ListAction) -> Option<(Range<usize>, String)> {
     let row = text.offset_to_point(cursor).row;
     let line_start = text.line_start_offset(row);
-    let checkbox = checkbox_line(text, row)?;
-    let mark = checkbox.marker.start + 1;
+    let item = list_line(text, row)?;
 
     match action {
-        CheckboxAction::Toggle => {
-            let replacement = if checkbox.completed { " " } else { "x" };
+        ListAction::ToggleCheckbox => {
+            let ListKind::Checkbox(completed) = item.kind else {
+                return None;
+            };
+            let mark = item.marker.start + 1;
+            let replacement = if completed { " " } else { "x" };
             Some((mark..mark + 1, replacement.into()))
         }
-        CheckboxAction::Continue
-            if cursor == checkbox.line_end && checkbox.label_start.is_some() =>
-        {
-            let newline = if checkbox.line_end < text.line_end_offset(row) {
+        ListAction::Continue if cursor == item.line_end && item.label_start.is_some() => {
+            let newline = if item.line_end < text.line_end_offset(row) {
                 "\r\n"
             } else {
                 "\n"
             };
-            let indent = text.slice(line_start..checkbox.marker.start);
-            Some((cursor..cursor, format!("{newline}{indent}[ ] ")))
+            let indent = text.slice(line_start..item.marker.start);
+            let marker = match item.kind {
+                ListKind::Checkbox(_) => "[ ]".to_owned(),
+                ListKind::Bullet => "-".to_owned(),
+                ListKind::Number(999_999_999) => return None,
+                ListKind::Number(number) => format!("{}.", number + 1),
+            };
+            Some((cursor..cursor, format!("{newline}{indent}{marker} ")))
         }
-        CheckboxAction::Continue | CheckboxAction::RemoveEmpty
-            if checkbox.label_start.is_none() && cursor == checkbox.line_end =>
+        ListAction::Continue | ListAction::RemoveEmpty
+            if item.label_start.is_none() && cursor == item.line_end =>
         {
-            Some((checkbox.marker.start..checkbox.line_end, String::new()))
+            Some((item.marker.start..item.line_end, String::new()))
         }
         _ => None,
     }
 }
 
-struct CheckboxLine {
+struct ListLine {
     marker: Range<usize>,
-    completed: bool,
+    kind: ListKind,
     label_start: Option<usize>,
     line_end: usize,
 }
 
-fn checkbox_line(text: &Rope, row: usize) -> Option<CheckboxLine> {
+enum ListKind {
+    Checkbox(bool),
+    Bullet,
+    Number(u32),
+}
+
+fn list_line(text: &Rope, row: usize) -> Option<ListLine> {
     let line = text.slice_line(row);
     let mut bytes = line
         .bytes()
         .enumerate()
         .skip_while(|(_, byte)| matches!(byte, b' ' | b'\t'))
         .peekable();
-    let (marker_start, b'[') = bytes.next()? else {
-        return None;
-    };
-    let completed = match bytes.next()?.1 {
-        b' ' => false,
-        b'x' | b'X' => true,
+    let (marker_start, first) = bytes.next()?;
+    let (marker_end, kind) = match first {
+        b'[' => {
+            let completed = match bytes.next()?.1 {
+                b' ' => false,
+                b'x' | b'X' => true,
+                _ => return None,
+            };
+            if bytes.next()?.1 != b']' {
+                return None;
+            }
+            (marker_start + 3, ListKind::Checkbox(completed))
+        }
+        b'-' => (marker_start + 1, ListKind::Bullet),
+        b'0'..=b'9' => {
+            let mut number = u32::from(first - b'0');
+            while let Some((index, digit)) = bytes.next_if(|(_, byte)| byte.is_ascii_digit()) {
+                if index - marker_start >= 9 {
+                    return None;
+                }
+                number = number * 10 + u32::from(digit - b'0');
+            }
+            let (period, b'.') = bytes.next()? else {
+                return None;
+            };
+            (period + 1, ListKind::Number(number))
+        }
         _ => return None,
     };
-    if bytes.next()?.1 != b']' || !matches!(bytes.peek(), None | Some((_, b' ' | b'\t' | b'\r'))) {
+    if !matches!(bytes.peek(), None | Some((_, b' ' | b'\t' | b'\r'))) {
         return None;
     }
     let line_start = text.line_start_offset(row);
-    let marker_end = marker_start + 3;
     let line_end = line.len() - usize::from(line.byte(line.len() - 1) == b'\r');
     let label_start = bytes
         .find(|(_, byte)| !matches!(byte, b' ' | b'\t' | b'\r'))
         .map(|(offset, _)| line_start + offset);
-    Some(CheckboxLine {
+    Some(ListLine {
         marker: line_start + marker_start..line_start + marker_end,
-        completed,
+        kind,
         label_start,
         line_end: line_start + line_end,
     })
@@ -703,8 +735,8 @@ impl InputHighlighter for NoteHighlighter {
                 color: Some(rgb(COMMENT).into()),
                 ..HighlightStyle::default()
             };
-            if let Some(checkbox) = checkbox_line(text, row)
-                && checkbox.completed
+            if let Some(checkbox) = list_line(text, row)
+                && matches!(checkbox.kind, ListKind::Checkbox(true))
             {
                 let label_start = checkbox.label_start.unwrap_or(row_end);
                 let plain = HighlightStyle::default();
@@ -795,32 +827,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn continues_bulleted_and_numbered_lists_and_exits_empty_items() {
+        for (original, continued, cleared) in [
+            ("  - Café", "  - Café\n  - ", "  - Café\n  "),
+            ("\t9. Café", "\t9. Café\n\t10. ", "\t9. Café\n\t"),
+        ] {
+            let mut note = Rope::from(original);
+            let (range, replacement) = list_edit(&note, note.len(), ListAction::Continue).unwrap();
+            note.replace(range, &replacement);
+            assert_eq!(note.to_string(), continued);
+
+            for action in [ListAction::Continue, ListAction::RemoveEmpty] {
+                let (range, replacement) = list_edit(&note, note.len(), action).unwrap();
+                let mut result = note.clone();
+                result.replace(range, &replacement);
+                assert_eq!(result.to_string(), cleared);
+            }
+
+            assert!(list_edit(&note, original.len(), ListAction::ToggleCheckbox).is_none());
+        }
+    }
+
+    #[test]
+    fn only_continues_list_markers_at_the_start_of_a_line() {
+        for plain in ["See 1. detail", "1.example", "---", "-word", "12.5"] {
+            let note = Rope::from(plain);
+            assert!(list_edit(&note, note.len(), ListAction::Continue).is_none());
+        }
+        let note = Rope::from("2. Two\r\nnext");
+        assert_eq!(
+            list_edit(&note, 6, ListAction::Continue),
+            Some((6..6, "\r\n3. ".into()))
+        );
+        assert!(list_edit(&note, 4, ListAction::Continue).is_none());
+    }
+
+    #[test]
     fn continues_checkboxes_and_clears_empty_markers() {
         let mut note = Rope::from("\t[x] Café");
-        let (range, replacement) =
-            checkbox_edit(&note, note.len(), CheckboxAction::Continue).unwrap();
+        let (range, replacement) = list_edit(&note, note.len(), ListAction::Continue).unwrap();
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "\t[x] Café\n\t[ ] ");
 
-        for action in [CheckboxAction::Continue, CheckboxAction::RemoveEmpty] {
-            let (range, replacement) = checkbox_edit(&note, note.len(), action).unwrap();
+        for action in [ListAction::Continue, ListAction::RemoveEmpty] {
+            let (range, replacement) = list_edit(&note, note.len(), action).unwrap();
             let mut cleared = note.clone();
             cleared.replace(range, &replacement);
             assert_eq!(cleared.to_string(), "\t[x] Café\n\t");
         }
 
-        assert!(checkbox_edit(&note, 5, CheckboxAction::Continue).is_none());
-        assert!(checkbox_edit(&note, "\t[x] Café".len(), CheckboxAction::RemoveEmpty).is_none());
+        assert!(list_edit(&note, 5, ListAction::Continue).is_none());
+        assert!(list_edit(&note, "\t[x] Café".len(), ListAction::RemoveEmpty).is_none());
         let plain = Rope::from("See [ ] example");
-        assert!(checkbox_edit(&plain, plain.len(), CheckboxAction::Continue).is_none());
+        assert!(list_edit(&plain, plain.len(), ListAction::Continue).is_none());
     }
 
     #[test]
     fn toggles_plain_text_and_strikes_only_completed_labels() {
         let mut note = Rope::from("// note\n[ ] Café /x\n[ ] Next");
         let cursor = "// note\n[ ] Café /x".len();
-        assert!(!checkbox_line(&note, 1).unwrap().completed);
-        let (range, replacement) = checkbox_edit(&note, cursor, CheckboxAction::Toggle).unwrap();
+        assert!(matches!(
+            list_line(&note, 1).unwrap().kind,
+            ListKind::Checkbox(false)
+        ));
+        let (range, replacement) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "// note\n[x] Café /x\n[ ] Next");
 
@@ -834,7 +904,7 @@ mod tests {
         assert!(runs[3].1.strikethrough.is_some());
         assert!(runs[4].1.strikethrough.is_none());
 
-        let (range, replacement) = checkbox_edit(&note, cursor, CheckboxAction::Toggle).unwrap();
+        let (range, replacement) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
         note.replace(range, &replacement);
         assert_eq!(note.to_string(), "// note\n[ ] Café /x\n[ ] Next");
     }
