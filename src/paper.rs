@@ -1,15 +1,6 @@
-use std::{
-    borrow::Cow,
-    cell::{Cell, RefCell},
-    ops::Range,
-    rc::Rc,
-    time::Duration,
-};
+use std::{borrow::Cow, cell::RefCell, ops::Range, rc::Rc, time::Duration};
 
-use gpui_kit::base::input::{
-    AutoClosingPair, Backspace, EditorScrollbarContext, Enter, set_language_config,
-};
-use gpui_kit::base::{Scrollbar, ScrollbarHandle};
+use gpui_kit::base::input::{AutoClosingPair, Backspace, Enter, set_language_config};
 use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::input::{
     DisplayPoint, Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit,
@@ -18,13 +9,16 @@ use gpui_kit::component::input::{
 use gpui_kit::component::{Sizable, Size};
 use gpui_kit::{
     Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
-    HighlightStyle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, UnderlineStyle, Window, canvas,
-    combine_highlights, deferred, div, ease_out_quint, fill, font, point, px, rgb, size,
+    HighlightStyle, HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
+    Pixels, Point, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    UnderlineStyle, Window, canvas, combine_highlights, div, ease_out_quint, fill, font, point, px,
+    rgb, size,
 };
 
+use crate::list_edit::{FencedCode, ListAction, ListKind, list_edit, list_line, scan_line};
 use crate::markup::{self, Format, WebLink};
+use crate::note_edit::TextEdit;
+use crate::note_scroll::{NOTE_MARGIN, NoteScroll};
 
 const NOTE_LANGUAGE: &str = "handynotes-markdown";
 const PAIRS: [(&str, &str); 6] = [
@@ -37,12 +31,8 @@ const PAIRS: [(&str, &str); 6] = [
 ];
 const PAPER: u32 = 0xffffff;
 const DOT: u32 = 0xe1eaf3;
-const NOTE_MARGIN: Pixels = px(23.);
-const SCROLL_SPEED: f32 = 0.65;
-const SCROLL_EPSILON: Pixels = px(0.001);
 const COMMENT: u32 = 0x525252;
 const LINK: u32 = 0x245a96;
-const MAX_LIST_NUMBER: u32 = 999_999_999;
 const COMPLETED_BOX: u32 = 0x9b60bb;
 const COMMENT_PREFIX: &str = "// ";
 const HEADING_COLORS: [u32; 6] = [
@@ -85,65 +75,14 @@ pub fn register_language(cx: &mut App) {
 #[derive(Clone)]
 pub struct NoteEditor {
     pub state: Entity<EditorState>,
-    inset: Rc<Cell<Pixels>>,
+    scroll: NoteScroll,
     links: Rc<RefCell<Vec<WebLink>>>,
     link_hover: TextDecorationCollection,
 }
 
-#[derive(Clone)]
-struct NoteScrollbar {
-    editor: EditorScrollbarContext,
-    inset: Rc<Cell<Pixels>>,
-    track: Bounds<Pixels>,
-}
-
-impl ScrollbarHandle for NoteScrollbar {
-    fn viewport_bounds(&self) -> Bounds<Pixels> {
-        self.track
-    }
-
-    fn content_size(&self) -> gpui_kit::Size<Pixels> {
-        let mut content = self.editor.content_size();
-        if content.height > self.track.size.height {
-            content.height += NOTE_MARGIN;
-        }
-        content
-    }
-
-    fn offset(&self) -> Point<Pixels> {
-        let mut offset = self.editor.offset();
-        offset.y = note_scroll_offset(offset.y, visible_inset(offset.y, &self.inset));
-        offset
-    }
-
-    fn set_offset(&self, mut offset: Point<Pixels>) {
-        // The track includes the inset before the first row, so its thumb
-        // continues toward the top while the editor itself is at offset zero.
-        self.inset.set(inset_at_scroll_offset(offset.y));
-        offset.y = (offset.y + NOTE_MARGIN).min(px(0.));
-        self.editor.set_offset(offset);
-    }
-}
-
-fn note_scroll_offset(editor_offset: Pixels, inset: Pixels) -> Pixels {
-    editor_offset + inset - NOTE_MARGIN
-}
-
-fn inset_at_scroll_offset(offset: Pixels) -> Pixels {
-    (offset + NOTE_MARGIN).clamp(px(0.), NOTE_MARGIN)
-}
-
-fn visible_inset(offset: Pixels, inset: &Cell<Pixels>) -> Pixels {
-    if offset < -SCROLL_EPSILON {
-        px(0.)
-    } else {
-        inset.get()
-    }
-}
-
 pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEditor {
-    let inset = Rc::new(Cell::new(NOTE_MARGIN));
-    let scrollbar_inset = inset.clone();
+    let scroll = NoteScroll::new();
+    let scrollbar = scroll.clone();
     let links = Rc::new(RefCell::new(Vec::new()));
     let highlight_links = links.clone();
     let state = cx.new(|cx| {
@@ -161,21 +100,7 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEdi
             .cursor_surrounding_lines(Some(2))
             .searchable(false);
         state.set_scrollbar_renderer(Some(Rc::new(move |viewport, window, _| {
-            let mut track = viewport.viewport_bounds();
-            track.origin.y = window.visual_viewport_bounds().top();
-            let handle = NoteScrollbar {
-                editor: viewport,
-                inset: scrollbar_inset.clone(),
-                track,
-            };
-            let scrollbar = Scrollbar::vertical(&handle).styles(|styles| {
-                styles
-                    .thumb(|thumb| thumb.width(px(3.)).inset(px(0.)))
-                    .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
-                    .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
-            });
-            // Draw outside the translated editor's clip with a window-fixed track.
-            deferred(scrollbar).into_any_element()
+            scrollbar.scrollbar(viewport, window)
         })));
         state.set_highlighter_factory(
             Rc::new(move |_| {
@@ -193,26 +118,19 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEdi
     });
     NoteEditor {
         state,
-        inset,
+        scroll,
         links,
         link_hover,
     }
 }
 
 pub fn toggle_comment(state: &mut EditorState, window: &mut Window, cx: &mut Context<EditorState>) {
-    let selection = state.selected_range();
-    let reversed = state.is_selection_reversed();
-    if let Some((range, replacement, selection)) = comment_edit(state.text(), selection) {
-        state.set_selected_range(range, cx);
-        state.replace(replacement, window, cx);
-        state.set_selected_range_with_direction(selection, reversed, cx);
+    if let Some(edit) = comment_edit(state.text(), state.selected_range()) {
+        edit.apply(state, window, cx);
     }
 }
 
-fn comment_edit(
-    text: &Rope,
-    selection: Range<usize>,
-) -> Option<(Range<usize>, String, Range<usize>)> {
+fn comment_edit(text: &Rope, selection: Range<usize>) -> Option<TextEdit> {
     let first = text.offset_to_point(selection.start).row;
     // A selection ending at the start of a line doesn't include that line.
     let last_byte = selection.end - usize::from(!selection.is_empty());
@@ -264,23 +182,17 @@ fn comment_edit(
         line_start += line.len() + 1;
     }
 
-    (replacement != source).then_some((range, replacement, adjusted))
+    (replacement != source).then_some(TextEdit {
+        range,
+        replacement,
+        selection_after: adjusted,
+    })
 }
 
 pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl IntoElement {
     let state = &note.state;
-    let inset = note.inset.clone();
-    let editor = state.read(cx);
-    let offset = editor.scroll_offset().y;
-    let top_inset = if editor.text().len() == 0 {
-        inset.set(NOTE_MARGIN);
-        NOTE_MARGIN
-    } else {
-        if offset < -SCROLL_EPSILON {
-            inset.set(NOTE_MARGIN);
-        }
-        visible_inset(offset, &inset)
-    };
+    let scroll = note.scroll.clone();
+    let top_inset = scroll.top_inset(state.read(cx));
     let scroll_state = state.clone();
     let enter_state = state.clone();
     let backspace_state = state.clone();
@@ -387,7 +299,7 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
             canvas(
                 |area, window, _| window.insert_hitbox(area, HitboxBehavior::Normal),
                 move |area, hitbox, window, _| {
-                    scroll_note(hitbox, scroll_state, inset, window);
+                    scroll.listen(hitbox, scroll_state, window);
                     let spacing = px(16.);
                     let origin = area.origin;
                     let mut y = px(12.);
@@ -487,66 +399,6 @@ fn link_at_position<'a>(
         })
 }
 
-fn scroll_note(
-    hitbox: Hitbox,
-    editor: Entity<EditorState>,
-    inset: Rc<Cell<Pixels>>,
-    window: &mut Window,
-) {
-    let replaying = Rc::new(Cell::new(false));
-    window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-        if !phase.capture() || replaying.get() || !hitbox.should_handle_scroll(window) {
-            return;
-        }
-        let state = editor.read(cx);
-        let line_height = state.line_height().unwrap_or(window.line_height());
-        let pixels = event.delta.pixel_delta(line_height);
-        if pixels.y == px(0.) || pixels.y.abs() < pixels.x.abs() {
-            return;
-        }
-        let empty = state.text().len() == 0;
-        cx.stop_propagation();
-        if empty {
-            return;
-        }
-        let mut event = event.clone();
-        let editor = editor.clone();
-        let inset = inset.clone();
-        let replaying = replaying.clone();
-        // GPUI restores its mouse listeners after dispatch. Replay then so its
-        // editor still handles the gesture phases, momentum and edge behavior.
-        window.defer(cx, move |window, cx| {
-            let offset = editor.read(cx).scroll_offset().y;
-            let old_inset = visible_inset(offset, &inset);
-            let travel = pixels.y * SCROLL_SPEED;
-            // Scroll through the blank inset before scrolling text into the clip.
-            let destination = note_scroll_offset(offset, old_inset) + travel;
-            let new_inset = inset_at_scroll_offset(destination);
-            if new_inset != old_inset {
-                inset.set(new_inset);
-                window.refresh();
-            }
-            let remaining = travel - (new_inset - old_inset);
-            let factor = if remaining.abs() < SCROLL_EPSILON {
-                0.
-            } else {
-                remaining / pixels.y
-            };
-            event.delta = match event.delta {
-                ScrollDelta::Pixels(delta) => {
-                    ScrollDelta::Pixels(point(delta.x * factor, delta.y * factor))
-                }
-                ScrollDelta::Lines(delta) => {
-                    ScrollDelta::Lines(point(delta.x * factor, delta.y * factor))
-                }
-            };
-            replaying.set(true);
-            window.dispatch_event(PlatformInput::Scroll(event), cx);
-            replaying.set(false);
-        });
-    });
-}
-
 fn edit_selected_text(
     editor: &Entity<EditorState>,
     event: &KeyDownEvent,
@@ -579,31 +431,23 @@ fn edit_selected_text(
             let selected = state.text().slice(selection.clone());
             let wrapped = format!("{open}{selected}{close}");
             let inner = selection.start + open.len()..selection.end + open.len();
-            (selection, wrapped, inner)
+            TextEdit {
+                range: selection,
+                replacement: wrapped,
+                selection_after: inner,
+            }
         })
     } else {
         return;
     };
 
-    if let Some((range, replacement, selection)) = edit {
-        let reversed = state.is_selection_reversed();
+    if let Some(edit) = edit {
         editor.update(cx, |state, cx| {
-            if state.selected_range() != range {
-                state.set_selected_range(range, cx);
-            }
-            state.replace(replacement, window, cx);
-            state.set_selected_range_with_direction(selection, reversed, cx);
+            edit.apply(state, window, cx);
         });
     }
     window.prevent_default();
     cx.stop_propagation();
-}
-
-#[derive(Clone, Copy)]
-enum ListAction {
-    Continue,
-    RemoveEmpty,
-    ToggleCheckbox,
 }
 
 fn handle_list_action(
@@ -640,7 +484,8 @@ fn toggle_clicked_checkbox(
     }
     let marker = state.visible_row_range().and_then(|mut rows| {
         rows.find_map(|row| {
-            let item = list_line(state.text(), row)?;
+            // The edit validates the candidate against fenced code.
+            let item = scan_line(state.text(), row)?;
             if !matches!(item.kind, ListKind::Checkbox(_)) {
                 return None;
             }
@@ -664,220 +509,39 @@ fn apply_list_action(
     cx: &mut App,
 ) {
     let state = editor.read(cx);
-    let Some((range, replacement, caret)) = list_edit(state.text(), offset, action) else {
+    let Some(mut edit) = list_edit(state.text(), offset, action) else {
         return;
     };
-    let caret = if matches!(action, ListAction::ToggleCheckbox) {
-        state.cursor()
-    } else {
-        caret
-    };
+    if matches!(action, ListAction::ToggleCheckbox) {
+        edit.selection_after = state.selected_range();
+    }
     editor.update(cx, |state, cx| {
-        state.set_selected_range(range, cx);
-        state.replace(replacement, window, cx);
-        if state.cursor() != caret {
-            state.set_selected_range(caret..caret, cx);
-        }
+        edit.apply(state, window, cx);
     });
     cx.stop_propagation();
-}
-
-fn list_edit(
-    text: &Rope,
-    cursor: usize,
-    action: ListAction,
-) -> Option<(Range<usize>, String, usize)> {
-    let row = text.offset_to_point(cursor).row;
-    let line_start = text.line_start_offset(row);
-    let item = list_line(text, row)?;
-    let indent = text.slice(line_start..item.marker.start);
-
-    let (mut range, mut replacement, caret, next_number) = match action {
-        ListAction::ToggleCheckbox => {
-            let ListKind::Checkbox(completed) = item.kind else {
-                return None;
-            };
-            let mark = item.marker.start + 1;
-            let replacement = if completed { " " } else { "x" };
-            return Some((mark..mark + 1, replacement.into(), cursor));
-        }
-        ListAction::Continue if cursor == item.line_end && item.label_start.is_some() => {
-            let newline = if item.line_end < text.line_end_offset(row) {
-                "\r\n"
-            } else {
-                "\n"
-            };
-            let (marker, next_number) = match item.kind {
-                ListKind::Checkbox(_) => ("[ ]".to_owned(), None),
-                ListKind::Bullet => ("-".to_owned(), None),
-                ListKind::Number(MAX_LIST_NUMBER) => return None,
-                ListKind::Number(number) => (format!("{}.", number + 1), Some(number + 2)),
-            };
-            let replacement = format!("{newline}{indent}{marker} ");
-            let caret = cursor + replacement.len();
-            (cursor..cursor, replacement, caret, next_number)
-        }
-        ListAction::Continue | ListAction::RemoveEmpty
-            if item.label_start.is_none() && cursor == item.line_end =>
-        {
-            let next_number = match item.kind {
-                ListKind::Number(number) => Some(number),
-                _ => None,
-            };
-            (
-                item.marker.start..item.line_end,
-                String::new(),
-                item.marker.start,
-                next_number,
-            )
-        }
-        _ => return None,
-    };
-    if let Some(number) = next_number {
-        range.end = renumber_following_items(
-            text,
-            row,
-            indentation_width(indent.bytes()),
-            number,
-            range.end,
-            &mut replacement,
-        );
-    }
-    Some((range, replacement, caret))
-}
-
-fn indentation_width(bytes: impl Iterator<Item = u8>) -> usize {
-    bytes
-        .take_while(|byte| matches!(byte, b' ' | b'\t'))
-        .fold(0, |column, byte| {
-            if byte == b'\t' {
-                column + (4 - column % 4)
-            } else {
-                column + 1
-            }
-        })
-}
-
-fn renumber_following_items(
-    text: &Rope,
-    row: usize,
-    indentation: usize,
-    mut number: u32,
-    mut end: usize,
-    replacement: &mut String,
-) -> usize {
-    for row in row + 1..text.lines_len() {
-        let line = text.slice_line(row);
-        if line
-            .bytes()
-            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
-        {
-            break;
-        }
-        let width = indentation_width(line.bytes());
-        if width > indentation {
-            continue;
-        }
-        if width < indentation || number > MAX_LIST_NUMBER {
-            break;
-        }
-        let Some(item) = list_line(text, row) else {
-            break;
-        };
-        let ListKind::Number(current) = item.kind else {
-            break;
-        };
-        if current != number {
-            replacement.push_str(&text.slice(end..item.marker.start).to_string());
-            replacement.push_str(&format!("{number}."));
-            end = item.marker.end;
-        }
-        number += 1;
-    }
-    end
-}
-
-struct ListLine {
-    marker: Range<usize>,
-    kind: ListKind,
-    label_start: Option<usize>,
-    line_end: usize,
-}
-
-enum ListKind {
-    Checkbox(bool),
-    Bullet,
-    Number(u32),
-}
-
-fn list_line(text: &Rope, row: usize) -> Option<ListLine> {
-    let line = text.slice_line(row);
-    let mut bytes = line
-        .bytes()
-        .enumerate()
-        .skip_while(|(_, byte)| matches!(byte, b' ' | b'\t'))
-        .peekable();
-    let (marker_start, first) = bytes.next()?;
-    let (marker_end, kind) = match first {
-        b'[' => {
-            let completed = match bytes.next()?.1 {
-                b' ' => false,
-                b'x' | b'X' => true,
-                _ => return None,
-            };
-            if bytes.next()?.1 != b']' {
-                return None;
-            }
-            (marker_start + 3, ListKind::Checkbox(completed))
-        }
-        b'-' => (marker_start + 1, ListKind::Bullet),
-        b'0'..=b'9' => {
-            let mut number = u32::from(first - b'0');
-            while let Some((index, digit)) = bytes.next_if(|(_, byte)| byte.is_ascii_digit()) {
-                if index - marker_start >= 9 {
-                    return None;
-                }
-                number = number * 10 + u32::from(digit - b'0');
-            }
-            let (period, b'.') = bytes.next()? else {
-                return None;
-            };
-            (period + 1, ListKind::Number(number))
-        }
-        _ => return None,
-    };
-    if !matches!(bytes.peek(), None | Some((_, b' ' | b'\t' | b'\r'))) {
-        return None;
-    }
-    let line_start = text.line_start_offset(row);
-    let line_end = line.len() - usize::from(line.byte(line.len() - 1) == b'\r');
-    let label_start = bytes
-        .find(|(_, byte)| !matches!(byte, b' ' | b'\t' | b'\r'))
-        .map(|(offset, _)| line_start + offset);
-    Some(ListLine {
-        marker: line_start + marker_start..line_start + marker_end,
-        kind,
-        label_start,
-        line_end: line_start + line_end,
-    })
 }
 
 #[derive(Default)]
 struct NoteHighlighter {
     text: Rope,
     inline: Vec<(Range<usize>, HighlightStyle)>,
+    fenced: FencedCode,
     links: Rc<RefCell<Vec<WebLink>>>,
 }
 
 impl NoteHighlighter {
     fn new(text: Rope, links: Rc<RefCell<Vec<WebLink>>>) -> Self {
-        let (inline, found) = if text
+        let (inline, found, fenced) = if text
             .bytes()
-            .any(|byte| matches!(byte, b'*' | b'_' | b'~' | b':' | b'.'))
+            .any(|byte| matches!(byte, b'*' | b'_' | b'~' | b':' | b'.' | b'`'))
         {
-            markup::highlights(&text.to_string())
+            let source = text.to_string();
+            markup::parse(&source).map_or_else(Default::default, |root| {
+                let (inline, links) = markup::highlights(&source, &root);
+                (inline, links, FencedCode::from_root(&root, &source))
+            })
         } else {
-            (Vec::new(), Vec::new())
+            Default::default()
         };
         let link_styles = found.iter().map(|link| {
             (
@@ -893,6 +557,7 @@ impl NoteHighlighter {
         Self {
             text,
             inline,
+            fenced,
             links,
         }
     }
@@ -985,7 +650,7 @@ impl InputHighlighter for NoteHighlighter {
                 color: Some(rgb(COMMENT).into()),
                 ..HighlightStyle::default()
             };
-            if let Some(checkbox) = list_line(text, row)
+            if let Some(checkbox) = list_line(text, row, &self.fenced)
                 && matches!(checkbox.kind, ListKind::Checkbox(true))
             {
                 let label_start = checkbox.label_start.unwrap_or(row_end);
@@ -1077,96 +742,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inserts_in_the_middle_and_renumbers_only_following_siblings() {
-        let original =
-            "7. Ciao\r\n8. Miao\r\n9. Bau\r\n   1. Nested\r\n10. More\r\n\r\n1. Separate";
-        let mut note = Rope::from(original);
-        let cursor = original.find("8. Miao").unwrap() + "8. Miao".len();
-        let (range, replacement, caret) = list_edit(&note, cursor, ListAction::Continue).unwrap();
-        note.replace(range, &replacement);
-        assert_eq!(
-            note.to_string(),
-            "7. Ciao\r\n8. Miao\r\n9. \r\n10. Bau\r\n   1. Nested\r\n11. More\r\n\r\n1. Separate"
-        );
-        assert_eq!(caret, cursor + "\r\n9. ".len());
-
-        let (range, replacement, _) = list_edit(&note, caret, ListAction::RemoveEmpty).unwrap();
-        note.replace(range, &replacement);
-        assert_eq!(
-            note.to_string(),
-            "7. Ciao\r\n8. Miao\r\n\r\n9. Bau\r\n   1. Nested\r\n10. More\r\n\r\n1. Separate"
-        );
-    }
-
-    #[test]
-    fn continues_bulleted_and_numbered_lists_and_exits_empty_items() {
-        for (original, continued, cleared) in [
-            ("  - Café", "  - Café\n  - ", "  - Café\n  "),
-            ("\t9. Café", "\t9. Café\n\t10. ", "\t9. Café\n\t"),
-        ] {
-            let mut note = Rope::from(original);
-            let (range, replacement, _) =
-                list_edit(&note, note.len(), ListAction::Continue).unwrap();
-            note.replace(range, &replacement);
-            assert_eq!(note.to_string(), continued);
-
-            for action in [ListAction::Continue, ListAction::RemoveEmpty] {
-                let (range, replacement, _) = list_edit(&note, note.len(), action).unwrap();
-                let mut result = note.clone();
-                result.replace(range, &replacement);
-                assert_eq!(result.to_string(), cleared);
-            }
-
-            assert!(list_edit(&note, original.len(), ListAction::ToggleCheckbox).is_none());
-        }
-    }
-
-    #[test]
-    fn only_continues_list_markers_at_the_start_of_a_line() {
-        for plain in ["See 1. detail", "1.example", "---", "-word", "12.5"] {
-            let note = Rope::from(plain);
-            assert!(list_edit(&note, note.len(), ListAction::Continue).is_none());
-        }
-        let note = Rope::from("2. Two\r\nnext");
-        assert_eq!(
-            list_edit(&note, 6, ListAction::Continue),
-            Some((6..6, "\r\n3. ".into(), 11))
-        );
-        assert!(list_edit(&note, 4, ListAction::Continue).is_none());
-    }
-
-    #[test]
-    fn continues_checkboxes_and_clears_empty_markers() {
-        let mut note = Rope::from("\t[x] Café");
-        let (range, replacement, _) = list_edit(&note, note.len(), ListAction::Continue).unwrap();
-        note.replace(range, &replacement);
-        assert_eq!(note.to_string(), "\t[x] Café\n\t[ ] ");
-
-        for action in [ListAction::Continue, ListAction::RemoveEmpty] {
-            let (range, replacement, _) = list_edit(&note, note.len(), action).unwrap();
-            let mut cleared = note.clone();
-            cleared.replace(range, &replacement);
-            assert_eq!(cleared.to_string(), "\t[x] Café\n\t");
-        }
-
-        assert!(list_edit(&note, 5, ListAction::Continue).is_none());
-        assert!(list_edit(&note, "\t[x] Café".len(), ListAction::RemoveEmpty).is_none());
-        let plain = Rope::from("See [ ] example");
-        assert!(list_edit(&plain, plain.len(), ListAction::Continue).is_none());
-    }
-
-    #[test]
-    fn toggles_plain_text_and_strikes_only_completed_labels() {
-        let mut note = Rope::from("// note\n[ ] Café /x\n[ ] Next");
-        let cursor = "// note\n[ ] Café /x".len();
-        assert!(matches!(
-            list_line(&note, 1).unwrap().kind,
-            ListKind::Checkbox(false)
-        ));
-        let (range, replacement, _) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
-        note.replace(range, &replacement);
-        assert_eq!(note.to_string(), "// note\n[x] Café /x\n[ ] Next");
-
+    fn strikes_only_completed_labels_outside_fenced_code() {
+        let note = Rope::from("// note\n[x] Café /x\n[ ] Next\n```\n[x] Example\n```");
         let highlighter = NoteHighlighter::new(note.clone(), Rc::default());
         let resolver = InputEditorStyle::default().highlight_styles;
         let runs = highlighter.styles(&(0..note.len()), resolver.as_ref());
@@ -1175,11 +752,11 @@ mod tests {
         assert_eq!(runs[0].1.color, runs[3].1.color);
         assert_eq!(note.slice(runs[3].0.clone()).to_string(), "Café /x\n");
         assert!(runs[3].1.strikethrough.is_some());
-        assert!(runs[4].1.strikethrough.is_none());
-
-        let (range, replacement, _) = list_edit(&note, cursor, ListAction::ToggleCheckbox).unwrap();
-        note.replace(range, &replacement);
-        assert_eq!(note.to_string(), "// note\n[ ] Café /x\n[ ] Next");
+        assert!(
+            runs[4..]
+                .iter()
+                .all(|(_, style)| *style == HighlightStyle::default())
+        );
     }
 
     #[test]
@@ -1188,14 +765,20 @@ mod tests {
         let selection = 4..original.find("next").unwrap();
         let mut note = original.to_owned();
 
-        let (range, replacement, adjusted) =
-            comment_edit(&Rope::from(note.as_str()), selection.clone()).unwrap();
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: adjusted,
+        } = comment_edit(&Rope::from(note.as_str()), selection.clone()).unwrap();
         note.replace_range(range, &replacement);
         assert_eq!(note, "  // Café\r\n\r\n\t// // detail\r\nnext");
         assert_eq!(&note[adjusted.clone()], "fé\r\n\r\n\t// // detail\r\n");
 
-        let (range, replacement, restored) =
-            comment_edit(&Rope::from(note.as_str()), adjusted).unwrap();
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: restored,
+        } = comment_edit(&Rope::from(note.as_str()), adjusted).unwrap();
         note.replace_range(range, &replacement);
         assert_eq!(note, original);
         assert_eq!(restored, selection);
@@ -1203,13 +786,20 @@ mod tests {
 
     #[test]
     fn toggles_at_the_caret_and_removes_markers_without_spaces() {
-        let (range, replacement, selection) = comment_edit(&Rope::from("a\n"), 2..2).unwrap();
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: selection,
+        } = comment_edit(&Rope::from("a\n"), 2..2).unwrap();
         assert_eq!(range, 2..2);
         assert_eq!(replacement, "// ");
         assert_eq!(selection, 5..5);
 
-        let (range, replacement, selection) =
-            comment_edit(&Rope::from("  //Café\n"), 4..4).unwrap();
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: selection,
+        } = comment_edit(&Rope::from("  //Café\n"), 4..4).unwrap();
         assert_eq!(range, 0..9);
         assert_eq!(replacement, "  Café");
         assert_eq!(selection, 2..2);

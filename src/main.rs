@@ -12,8 +12,11 @@ use store::NoteStore;
 
 mod account;
 mod cloud;
+mod list_edit;
 mod markup;
 mod native;
+mod note_edit;
+mod note_scroll;
 mod oauth;
 mod paper;
 mod store;
@@ -176,9 +179,6 @@ impl Notebook {
     }
 
     fn open(&mut self, id: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
-        if id.is_none() && self.current.is_some() && !self.can_create_note(cx) {
-            return;
-        }
         if !self.save(cx) {
             cx.notify();
             return;
@@ -200,6 +200,12 @@ impl Notebook {
         self.searching = false;
         window.focus(&self.editor.state.focus_handle(cx), cx);
         cx.notify();
+    }
+
+    fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.current.is_none() || self.can_create_note(cx) {
+            self.open(None, window, cx);
+        }
     }
 
     fn step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
@@ -290,7 +296,7 @@ impl Notebook {
             }
             (true, ",") => self.open_account(w, cx),
             (true, "f" | "p") => self.search(w, cx),
-            (true, "n") => self.open(None, w, cx),
+            (true, "n") => self.new_note(w, cx),
             (true, "w") | (false, "escape") if !self.searching => self.hide(cx),
             (true, "q") => {
                 if self.save(cx) {
@@ -616,7 +622,7 @@ impl Render for Notebook {
                         action("new-note", can_create_note)
                             .child(Icon::new(IconName::Plus).size(px(16.)))
                             .when(can_create_note, |s| {
-                                s.on_click(cx.listener(|s, _, w, cx| s.open(None, w, cx)))
+                                s.on_click(cx.listener(|s, _, w, cx| s.new_note(w, cx)))
                             }),
                     )
                     .with_animation(

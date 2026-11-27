@@ -4,6 +4,8 @@ use gpui_kit::{FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, combin
 use linkify::{LinkFinder, LinkKind};
 use markdown::{ParseOptions, mdast::Node, to_mdast};
 
+use crate::note_edit::TextEdit;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Bold,
@@ -52,36 +54,28 @@ struct Span {
 }
 
 fn spans(root: &Node) -> Vec<Span> {
-    fn collect(node: &Node, spans: &mut Vec<Span>) {
-        let format = match node {
-            Node::Strong(_) => Some(Format::Bold),
-            Node::Emphasis(_) => Some(Format::Italic),
-            Node::Delete(_) => Some(Format::Strike),
-            _ => None,
-        };
-        if let (Some(format), Some(position)) = (format, node.position()) {
+    nodes(root)
+        .filter_map(|node| {
+            let format = match node {
+                Node::Strong(_) => Format::Bold,
+                Node::Emphasis(_) => Format::Italic,
+                Node::Delete(_) => Format::Strike,
+                _ => return None,
+            };
+            let position = node.position()?;
             let source = position.start.offset..position.end.offset;
             let width = format.delimiter().len();
             let content = source.start + width..source.end - width;
-            spans.push(Span {
+            Some(Span {
                 format,
                 source,
                 content,
-            });
-        }
-        if let Some(children) = node.children() {
-            for child in children {
-                collect(child, spans);
-            }
-        }
-    }
-
-    let mut spans = Vec::new();
-    collect(root, &mut spans);
-    spans
+            })
+        })
+        .collect()
 }
 
-fn parse(text: &str) -> Option<Node> {
+pub(crate) fn parse(text: &str) -> Option<Node> {
     let mut options = ParseOptions::gfm();
     options.gfm_strikethrough_single_tilde = false;
     to_mdast(text, &options).ok()
@@ -93,12 +87,12 @@ pub struct WebLink {
     pub url: String,
 }
 
-pub fn highlights(text: &str) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<WebLink>) {
-    let Some(root) = parse(text) else {
-        return (Vec::new(), Vec::new());
-    };
+pub(crate) fn highlights(
+    text: &str,
+    root: &Node,
+) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<WebLink>) {
     let mut definitions = HashMap::new();
-    for node in nodes(&root) {
+    for node in nodes(root) {
         if let Node::Definition(definition) = node {
             definitions
                 .entry(definition.identifier.as_str())
@@ -109,7 +103,7 @@ pub fn highlights(text: &str) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<WebLi
     finder.url_must_have_scheme(false);
     let mut links = Vec::new();
     let mut link_end = 0;
-    for node in nodes(&root) {
+    for node in nodes(root) {
         let Some(position) = node.position() else {
             continue;
         };
@@ -158,13 +152,13 @@ pub fn highlights(text: &str) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<WebLi
             });
         }
     }
-    let inline = spans(&root)
+    let inline = spans(root)
         .into_iter()
         .map(|span| (span.content, span.format.style()));
     (combine_highlights(inline, []).collect(), links)
 }
 
-fn nodes(root: &Node) -> impl Iterator<Item = &Node> {
+pub(crate) fn nodes(root: &Node) -> impl Iterator<Item = &Node> {
     let mut stack = vec![root];
     std::iter::from_fn(move || {
         let node = stack.pop()?;
@@ -175,13 +169,14 @@ fn nodes(root: &Node) -> impl Iterator<Item = &Node> {
     })
 }
 
-pub fn format_selection(
+pub(crate) fn format_selection(
     text: &str,
     selection: Range<usize>,
     format: Format,
-) -> Option<(Range<usize>, String, Range<usize>)> {
+) -> Option<TextEdit> {
     let selection = trim_selection(text, selection)?;
-    let spans = parse(text).as_ref().map_or_else(Vec::new, spans);
+    let root = parse(text)?;
+    let spans = spans(&root);
     let delimiter = format.delimiter();
 
     if let Some(span) = matching_span(&spans, &selection, format) {
@@ -190,46 +185,177 @@ pub fn format_selection(
         } else {
             selection.start - delimiter.len()..selection.end - delimiter.len()
         };
-        return Some((
-            span.source.clone(),
-            text[span.content.clone()].into(),
-            adjusted,
-        ));
+        return Some(TextEdit {
+            range: span.source.clone(),
+            replacement: text[span.content.clone()].into(),
+            selection_after: adjusted,
+        });
     }
 
-    let selected = &text[selection.clone()];
-    if !selected.contains('\n') {
-        let delimiter = opening_delimiter(text, &selection, format);
-        let adjusted = selection.start + delimiter.len()..selection.end + delimiter.len();
-        let wrapped = format!("{delimiter}{selected}{delimiter}");
-        return Some((selection, wrapped, adjusted));
-    }
-
-    // A Markdown inline span cannot cross a blank line or other block boundary.
-    let mut offset = selection.start;
-    let mut replacement = String::new();
-    for line in selected.split_inclusive('\n') {
-        let end = offset + line.len();
-        if let Some(part) = trim_selection(text, offset..end) {
-            replacement.push_str(&text[offset..part.start]);
-            if let Some(span) = matching_span(&spans, &part, format)
-                && span.source == part
-            {
-                replacement.push_str(&text[span.content.clone()]);
-            } else {
-                let delimiter = opening_delimiter(text, &part, format);
-                replacement.push_str(delimiter);
-                replacement.push_str(&text[part.clone()]);
-                replacement.push_str(delimiter);
+    let selected_spans: Vec<_> = spans.iter().filter(|span| span.format == format).collect();
+    let mut unformatted = Vec::new();
+    let mut formatted = Vec::new();
+    for part in selected_inline_parts(text, &root, &selection) {
+        let mut start = part.start;
+        for span in &selected_spans {
+            if span.source.end <= start || span.source.start >= part.end {
+                continue;
             }
-            replacement.push_str(&text[part.end..end]);
-        } else {
-            replacement.push_str(line);
+            if let Some(gap) = trim_selection(text, start..start.max(span.source.start)) {
+                unformatted.push(gap);
+            }
+            formatted.push(*span);
+            start = part.end.min(span.source.end);
         }
-        offset = end;
+        if let Some(gap) = trim_selection(text, start..part.end) {
+            unformatted.push(gap);
+        }
     }
-    let adjusted = selection.start..selection.start + replacement.len();
-    Some((selection, replacement, adjusted))
+
+    // Apply the style to gaps in a mixed selection. Remove it only once the
+    // eligible selection is fully formatted.
+    if unformatted.is_empty() {
+        let mut edits = Vec::new();
+        for span in formatted {
+            edits.push(span.source.start..span.content.start);
+            edits.push(span.content.end..span.source.end);
+        }
+        edits.sort_unstable_by_key(|range| range.start);
+        edits.dedup();
+        let start = selection.start.min(edits.first()?.start);
+        let end = selection.end.max(edits.last()?.end);
+        let mut adjusted = selection.clone();
+        let mut replacement = String::new();
+        let mut offset = start;
+        for edit in edits {
+            replacement.push_str(&text[offset..edit.start]);
+            adjusted.start -= removed_before(&edit, selection.start);
+            adjusted.end -= removed_before(&edit, selection.end);
+            offset = edit.end;
+        }
+        replacement.push_str(&text[offset..end]);
+        return Some(TextEdit {
+            range: start..end,
+            replacement,
+            selection_after: adjusted,
+        });
+    }
+
+    let mut replacement = String::new();
+    let mut offset = selection.start;
+    let content_selection = if let [part] = unformatted.as_slice()
+        && formatted.is_empty()
+        && !text[selection.clone()].contains('\n')
+    {
+        let width = opening_delimiter(text, part, format).len();
+        Some(part.start + width..part.end + width)
+    } else {
+        None
+    };
+    for part in unformatted {
+        replacement.push_str(&text[offset..part.start]);
+        let delimiter = opening_delimiter(text, &part, format);
+        replacement.push_str(delimiter);
+        replacement.push_str(&text[part.clone()]);
+        replacement.push_str(delimiter);
+        offset = part.end;
+    }
+    replacement.push_str(&text[offset..selection.end]);
+    let adjusted =
+        content_selection.unwrap_or(selection.start..selection.start + replacement.len());
+    Some(TextEdit {
+        range: selection,
+        replacement,
+        selection_after: adjusted,
+    })
+}
+
+fn removed_before(edit: &Range<usize>, offset: usize) -> usize {
+    edit.end.min(offset).saturating_sub(edit.start)
+}
+
+fn selected_inline_parts(text: &str, root: &Node, selection: &Range<usize>) -> Vec<Range<usize>> {
+    let quotes: Vec<_> = nodes(root)
+        .filter(|node| matches!(node, Node::Blockquote(_)))
+        .filter_map(Node::position)
+        .collect();
+    let mut parts = Vec::new();
+    for block in nodes(root) {
+        if !matches!(
+            block,
+            Node::Heading(_) | Node::Paragraph(_) | Node::TableCell(_)
+        ) {
+            continue;
+        }
+        // The inline children exclude heading, list, blockquote, and task markers.
+        let Some(children) = block.children() else {
+            continue;
+        };
+        let Some(first) = children.first().and_then(Node::position) else {
+            continue;
+        };
+        let Some(last) = children.last().and_then(Node::position) else {
+            continue;
+        };
+        if first.start.offset >= selection.end || last.end.offset <= selection.start {
+            continue;
+        }
+
+        let mut offset = first.start.offset;
+        for (line_index, line) in text[first.start.offset..last.end.offset]
+            .split_inclusive('\n')
+            .enumerate()
+        {
+            let end = offset + line.len();
+            let mut start = offset;
+            if line_index > 0 {
+                // Inline nodes can span several physical lines in a blockquote.
+                // A continuation line may omit any of its quote markers.
+                let depth = quotes
+                    .iter()
+                    .filter(|quote| quote.start.offset <= offset && offset < quote.end.offset)
+                    .count();
+                for _ in 0..depth {
+                    let content = text[start..end].trim_start_matches([' ', '\t']);
+                    let Some(stripped) = content.strip_prefix('>') else {
+                        break;
+                    };
+                    start = end - stripped.len();
+                }
+            }
+            if matches!(block, Node::Paragraph(_)) {
+                start = after_checkbox_marker(text, start, end);
+            }
+            let start = start.max(selection.start);
+            let end_selected = end.min(selection.end);
+            if start < end_selected
+                && let Some(part) = trim_selection(text, start..end_selected)
+            {
+                parts.push(part);
+            }
+            offset = end;
+        }
+    }
+    parts
+}
+
+fn after_checkbox_marker(text: &str, start: usize, end: usize) -> usize {
+    let content = text[start..end].trim_start_matches([' ', '\t']);
+    let remainder = content
+        .strip_prefix("[ ]")
+        .or_else(|| content.strip_prefix("[x]"))
+        .or_else(|| content.strip_prefix("[X]"));
+    if let Some(remainder) = remainder
+        && (remainder.is_empty() || remainder.starts_with([' ', '\t', '\r', '\n']))
+        && text[..start]
+            .rsplit('\n')
+            .next()
+            .is_some_and(|prefix| prefix.trim_matches([' ', '\t']).is_empty())
+    {
+        end - remainder.len()
+    } else {
+        start
+    }
 }
 
 fn opening_delimiter(text: &str, selection: &Range<usize>, format: Format) -> &'static str {
@@ -275,14 +401,21 @@ fn matching_span<'a>(
 mod tests {
     use super::*;
 
+    fn highlights(text: &str) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<WebLink>) {
+        super::highlights(text, &parse(text).unwrap())
+    }
+
     #[test]
     fn defaults_to_underscores_and_keeps_emphasis_inside_words() {
         for (text, selection, expected) in [
             ("Café", 0.."Café".len(), "_Café_"),
             ("prefix", 3..6, "pre*fix*"),
         ] {
-            let (range, replacement, selected) =
-                format_selection(text, selection, Format::Italic).unwrap();
+            let TextEdit {
+                range,
+                replacement,
+                selection_after: selected,
+            } = format_selection(text, selection, Format::Italic).unwrap();
             let mut result = text.to_owned();
             result.replace_range(range, &replacement);
             assert_eq!(result, expected);
@@ -291,8 +424,9 @@ mod tests {
                 Some(FontStyle::Italic)
             );
 
-            let (range, replacement, _) =
-                format_selection(&result, selected, Format::Italic).unwrap();
+            let TextEdit {
+                range, replacement, ..
+            } = format_selection(&result, selected, Format::Italic).unwrap();
             result.replace_range(range, &replacement);
             assert_eq!(result, text);
         }
@@ -305,8 +439,11 @@ mod tests {
         let selection = start..start + "Café".len();
 
         for (format, expected) in [(Format::Bold, "é *Café*"), (Format::Italic, "é **Café**")] {
-            let (range, replacement, selected) =
-                format_selection(text, selection.clone(), format).unwrap();
+            let TextEdit {
+                range,
+                replacement,
+                selection_after: selected,
+            } = format_selection(text, selection.clone(), format).unwrap();
             let mut result = text.to_owned();
             result.replace_range(range, &replacement);
             assert_eq!(result, expected);
@@ -317,15 +454,106 @@ mod tests {
     #[test]
     fn formats_multiple_paragraphs_and_keeps_whitespace_outside_delimiters() {
         let text = " first  \n\nsecond ";
-        let (range, replacement, selected) =
-            format_selection(text, 0..text.len(), Format::Strike).unwrap();
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: selected,
+        } = format_selection(text, 0..text.len(), Format::Strike).unwrap();
         let mut result = text.to_owned();
         result.replace_range(range, &replacement);
         assert_eq!(result, " ~~first~~  \n\n~~second~~ ");
 
-        let (range, replacement, _) = format_selection(&result, selected, Format::Strike).unwrap();
+        let TextEdit {
+            range, replacement, ..
+        } = format_selection(&result, selected, Format::Strike).unwrap();
         result.replace_range(range, &replacement);
         assert_eq!(result, text);
+    }
+
+    #[test]
+    fn preserves_the_content_selection_when_toggling_bold_inline() {
+        let text = "é beforeCafé after";
+        let start = text.find("Café").unwrap();
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: selected,
+        } = format_selection(text, start..start + "Café".len(), Format::Bold).unwrap();
+        let mut result = text.to_owned();
+        result.replace_range(range, &replacement);
+        assert_eq!(result, "é before**Café** after");
+        assert_eq!(&result[selected.clone()], "Café");
+
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: selected,
+        } = format_selection(&result, selected, Format::Bold).unwrap();
+        result.replace_range(range, &replacement);
+        assert_eq!(result, text);
+        assert_eq!(&result[selected], "Café");
+    }
+
+    #[test]
+    fn formats_inline_content_and_preserves_block_markers() {
+        let text = concat!(
+            "# Café #\n\n",
+            "- one\n",
+            "  1. two\n",
+            "- [x] completed\n\n",
+            "[ ] todo\n[X] done\n\n",
+            "> quoted\n",
+            "> continued\n\n",
+            "Setext\n======",
+        );
+        let expected = concat!(
+            "# **Café** #\n\n",
+            "- **one**\n",
+            "  1. **two**\n",
+            "- [x] **completed**\n\n",
+            "[ ] **todo**\n[X] **done**\n\n",
+            "> **quoted**\n",
+            "> **continued**\n\n",
+            "**Setext**\n======",
+        );
+        let TextEdit {
+            range,
+            replacement,
+            selection_after: selected,
+        } = format_selection(text, 0..text.len(), Format::Bold).unwrap();
+        let mut result = text.to_owned();
+        result.replace_range(range, &replacement);
+        assert_eq!(result, expected);
+
+        let TextEdit {
+            range, replacement, ..
+        } = format_selection(&result, selected, Format::Bold).unwrap();
+        result.replace_range(range, &replacement);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn applies_bold_to_only_unformatted_parts_of_a_mixed_selection() {
+        let text = "**First**\nSecond";
+        for start in [0, 2] {
+            let TextEdit {
+                range,
+                replacement,
+                selection_after: selected,
+            } = format_selection(text, start..text.len(), Format::Bold).unwrap();
+            let mut result = text.to_owned();
+            result.replace_range(range, &replacement);
+            assert_eq!(result, "**First**\n**Second**");
+
+            let TextEdit {
+                range,
+                replacement,
+                selection_after: selected,
+            } = format_selection(&result, selected, Format::Bold).unwrap();
+            result.replace_range(range, &replacement);
+            assert_eq!(result, "First\nSecond");
+            assert_eq!(&result[selected], result);
+        }
     }
 
     #[test]
