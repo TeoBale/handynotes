@@ -1,19 +1,22 @@
 use std::{borrow::Cow, ops::Range, rc::Rc, time::Duration};
 
 use gpui_kit::base::Scrollbar;
+use gpui_kit::base::input::{Backspace, Enter};
 use gpui_kit::component::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
     RopeExt,
 };
 use gpui_kit::{
-    Animation, AnimationExt, App, AppContext as _, Bounds, Context, Entity, FontWeight,
-    HighlightStyle, IntoElement, ParentElement, Pixels, SharedString, Styled, Window, canvas, div,
-    ease_out_quint, fill, point, px, rgb, size,
+    Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
+    HighlightStyle, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, div, ease_out_quint,
+    fill, point, px, rgb, size,
 };
 
 const PAPER: u32 = 0xffffff;
 const DOT: u32 = 0xe1eaf3;
 const COMMENT: u32 = 0x525252;
+const COMPLETED_BOX: u32 = 0x9b60bb;
 const COMMENT_PREFIX: &str = "// ";
 const HEADING_COLORS: [u32; 6] = [
     0x89566c, // Dusty rose
@@ -137,16 +140,38 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) ->
     // Account for the editor's built-in line leading and horizontal inset.
     // Consume the extra first-line space as the document scrolls.
     let first_line_space = (px(15.) + state.read(cx).scroll_offset().y).clamp(px(0.), px(15.));
-    let editor = div().size_full().pt(first_line_space).pl(px(17.)).child(
-        Editor::new(state)
-            .aria_label("Note")
-            .appearance(false)
-            .h(gpui_kit::relative(1.0))
-            .font_family(NOTE_FONT)
-            .text_color(rgb(INK))
-            .text_size(NOTE_FONT_SIZE)
-            .line_height(px(23.)),
-    );
+    let enter_state = state.clone();
+    let backspace_state = state.clone();
+    let click_state = state.clone();
+    let editor = div()
+        .id(("note-editor", state.entity_id()))
+        .size_full()
+        .pt(first_line_space)
+        .pl(px(17.))
+        .capture_action(move |action: &Enter, window, cx| {
+            if !action.shift {
+                let action = if action.secondary {
+                    CheckboxAction::Toggle
+                } else {
+                    CheckboxAction::Continue
+                };
+                handle_checkbox_action(&enter_state, action, window, cx);
+            }
+        })
+        .capture_action(move |_: &Backspace, window, cx| {
+            handle_checkbox_action(&backspace_state, CheckboxAction::RemoveEmpty, window, cx);
+        })
+        .on_click(move |event, window, cx| toggle_clicked_checkbox(&click_state, event, window, cx))
+        .child(
+            Editor::new(state)
+                .aria_label("Note")
+                .appearance(false)
+                .h(gpui_kit::relative(1.0))
+                .font_family(NOTE_FONT)
+                .text_color(rgb(INK))
+                .text_size(NOTE_FONT_SIZE)
+                .line_height(px(23.)),
+        );
     let editor = match direction {
         Some(direction) => editor
             .with_animation(
@@ -197,6 +222,156 @@ pub fn paper(state: &Entity<EditorState>, direction: Option<isize>, cx: &App) ->
         .child(editor)
 }
 
+#[derive(Clone, Copy)]
+enum CheckboxAction {
+    Continue,
+    RemoveEmpty,
+    Toggle,
+}
+
+fn handle_checkbox_action(
+    editor: &Entity<EditorState>,
+    action: CheckboxAction,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let selection = editor.read(cx).selected_range();
+    if selection.is_empty() {
+        apply_checkbox_action(editor, selection.start, action, window, cx);
+    }
+}
+
+fn toggle_clicked_checkbox(
+    editor: &Entity<EditorState>,
+    event: &ClickEvent,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let ClickEvent::Mouse(click) = event else {
+        return;
+    };
+    let state = editor.read(cx);
+    let viewport = state.input_bounds();
+    if click.down.click_count != 1
+        || click.down.modifiers.modified()
+        || click.up.modifiers.modified()
+        || !state.selected_range().is_empty()
+        || !viewport.contains(&click.down.position)
+        || !viewport.contains(&click.up.position)
+    {
+        return;
+    }
+    let marker = state.visible_row_range().and_then(|mut rows| {
+        rows.find_map(|row| {
+            let checkbox = checkbox_line(state.text(), row)?;
+            let bounds = state.range_to_bounds(&checkbox.marker)?;
+            (Some(bounds.size.height) == state.line_height()
+                && bounds.contains(&click.down.position)
+                && bounds.contains(&click.up.position))
+            .then_some(checkbox.marker.start)
+        })
+    });
+    if let Some(offset) = marker {
+        apply_checkbox_action(editor, offset, CheckboxAction::Toggle, window, cx);
+    }
+}
+
+fn apply_checkbox_action(
+    editor: &Entity<EditorState>,
+    offset: usize,
+    action: CheckboxAction,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let state = editor.read(cx);
+    let Some((range, replacement)) = checkbox_edit(state.text(), offset, action) else {
+        return;
+    };
+    let cursor = state.cursor();
+    editor.update(cx, |state, cx| {
+        state.set_selected_range(range, cx);
+        state.replace(replacement, window, cx);
+        if matches!(action, CheckboxAction::Toggle) {
+            state.set_selected_range(cursor..cursor, cx);
+        }
+    });
+    cx.stop_propagation();
+}
+
+fn checkbox_edit(
+    text: &Rope,
+    cursor: usize,
+    action: CheckboxAction,
+) -> Option<(Range<usize>, String)> {
+    let row = text.offset_to_point(cursor).row;
+    let line_start = text.line_start_offset(row);
+    let checkbox = checkbox_line(text, row)?;
+    let mark = checkbox.marker.start + 1;
+
+    match action {
+        CheckboxAction::Toggle => {
+            let replacement = if checkbox.completed { " " } else { "x" };
+            Some((mark..mark + 1, replacement.into()))
+        }
+        CheckboxAction::Continue
+            if cursor == checkbox.line_end && checkbox.label_start.is_some() =>
+        {
+            let newline = if checkbox.line_end < text.line_end_offset(row) {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let indent = text.slice(line_start..checkbox.marker.start);
+            Some((cursor..cursor, format!("{newline}{indent}[ ] ")))
+        }
+        CheckboxAction::Continue | CheckboxAction::RemoveEmpty
+            if checkbox.label_start.is_none() && cursor == checkbox.line_end =>
+        {
+            Some((checkbox.marker.start..checkbox.line_end, String::new()))
+        }
+        _ => None,
+    }
+}
+
+struct CheckboxLine {
+    marker: Range<usize>,
+    completed: bool,
+    label_start: Option<usize>,
+    line_end: usize,
+}
+
+fn checkbox_line(text: &Rope, row: usize) -> Option<CheckboxLine> {
+    let line = text.slice_line(row);
+    let mut bytes = line
+        .bytes()
+        .enumerate()
+        .skip_while(|(_, byte)| matches!(byte, b' ' | b'\t'))
+        .peekable();
+    let (marker_start, b'[') = bytes.next()? else {
+        return None;
+    };
+    let completed = match bytes.next()?.1 {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    if bytes.next()?.1 != b']' || !matches!(bytes.peek(), None | Some((_, b' ' | b'\t' | b'\r'))) {
+        return None;
+    }
+    let line_start = text.line_start_offset(row);
+    let marker_end = marker_start + 3;
+    let line_end = line.len() - usize::from(line.byte(line.len() - 1) == b'\r');
+    let label_start = bytes
+        .find(|(_, byte)| !matches!(byte, b' ' | b'\t' | b'\r'))
+        .map(|(offset, _)| line_start + offset);
+    Some(CheckboxLine {
+        marker: line_start + marker_start..line_start + marker_end,
+        completed,
+        label_start,
+        line_end: line_start + line_end,
+    })
+}
+
 #[derive(Default)]
 struct NoteHighlighter(Rope);
 
@@ -234,7 +409,41 @@ impl InputHighlighter for NoteHighlighter {
             let line = text.slice_line(row);
             let line_start = text.line_start_offset(row);
             let start = line_start.max(range.start);
-            let end = text.line_start_offset(row + 1).min(range.end);
+            let row_end = text.line_start_offset(row + 1);
+            let end = row_end.min(range.end);
+            let muted = HighlightStyle {
+                color: Some(rgb(COMMENT).into()),
+                ..HighlightStyle::default()
+            };
+            if let Some(checkbox) = checkbox_line(text, row)
+                && checkbox.completed
+            {
+                let label_start = checkbox.label_start.unwrap_or(row_end);
+                let plain = HighlightStyle::default();
+                let lilac = HighlightStyle {
+                    color: Some(rgb(COMPLETED_BOX).into()),
+                    ..plain
+                };
+                let struck = HighlightStyle {
+                    strikethrough: Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        color: muted.color,
+                    }),
+                    ..muted
+                };
+                for (span, style) in [
+                    (line_start..checkbox.marker.start, plain),
+                    (checkbox.marker.clone(), lilac),
+                    (checkbox.marker.end..label_start, plain),
+                    (label_start..row_end, struck),
+                ] {
+                    let span = span.start.max(start)..span.end.min(end);
+                    if !span.is_empty() {
+                        runs.push((span, style));
+                    }
+                }
+                continue;
+            }
             let comment_start = comment_offset(line.bytes())
                 .map_or(end, |offset| (line_start + offset).clamp(start, end));
 
@@ -250,13 +459,7 @@ impl InputHighlighter for NoteHighlighter {
                 runs.push((start..comment_start, style));
             }
             if comment_start < end {
-                runs.push((
-                    comment_start..end,
-                    HighlightStyle {
-                        color: Some(rgb(COMMENT).into()),
-                        ..HighlightStyle::default()
-                    },
-                ));
+                runs.push((comment_start..end, muted));
             }
         }
 
@@ -302,6 +505,51 @@ mod tests {
     use gpui_kit::base::input::InputEditorStyle;
 
     use super::*;
+
+    #[test]
+    fn continues_checkboxes_and_clears_empty_markers() {
+        let mut note = Rope::from("\t[x] Café");
+        let (range, replacement) =
+            checkbox_edit(&note, note.len(), CheckboxAction::Continue).unwrap();
+        note.replace(range, &replacement);
+        assert_eq!(note.to_string(), "\t[x] Café\n\t[ ] ");
+
+        for action in [CheckboxAction::Continue, CheckboxAction::RemoveEmpty] {
+            let (range, replacement) = checkbox_edit(&note, note.len(), action).unwrap();
+            let mut cleared = note.clone();
+            cleared.replace(range, &replacement);
+            assert_eq!(cleared.to_string(), "\t[x] Café\n\t");
+        }
+
+        assert!(checkbox_edit(&note, 5, CheckboxAction::Continue).is_none());
+        assert!(checkbox_edit(&note, "\t[x] Café".len(), CheckboxAction::RemoveEmpty).is_none());
+        let plain = Rope::from("See [ ] example");
+        assert!(checkbox_edit(&plain, plain.len(), CheckboxAction::Continue).is_none());
+    }
+
+    #[test]
+    fn toggles_plain_text_and_strikes_only_completed_labels() {
+        let mut note = Rope::from("// note\n[ ] Café /x\n[ ] Next");
+        let cursor = "// note\n[ ] Café /x".len();
+        assert!(!checkbox_line(&note, 1).unwrap().completed);
+        let (range, replacement) = checkbox_edit(&note, cursor, CheckboxAction::Toggle).unwrap();
+        note.replace(range, &replacement);
+        assert_eq!(note.to_string(), "// note\n[x] Café /x\n[ ] Next");
+
+        let highlighter = NoteHighlighter(note.clone());
+        let resolver = InputEditorStyle::default().highlight_styles;
+        let runs = highlighter.styles(&(0..note.len()), resolver.as_ref());
+        assert_eq!(runs[1].1.color, Some(rgb(COMPLETED_BOX).into()));
+        assert!(runs[1].1.strikethrough.is_none());
+        assert_eq!(runs[0].1.color, runs[3].1.color);
+        assert_eq!(note.slice(runs[3].0.clone()).to_string(), "Café /x\n");
+        assert!(runs[3].1.strikethrough.is_some());
+        assert!(runs[4].1.strikethrough.is_none());
+
+        let (range, replacement) = checkbox_edit(&note, cursor, CheckboxAction::Toggle).unwrap();
+        note.replace(range, &replacement);
+        assert_eq!(note.to_string(), "// note\n[ ] Café /x\n[ ] Next");
+    }
 
     #[test]
     fn toggles_selected_lines_and_preserves_selection_and_indentation() {
