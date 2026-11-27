@@ -1,7 +1,9 @@
 use std::{borrow::Cow, cell::Cell, ops::Range, rc::Rc, time::Duration};
 
-use gpui_kit::base::Scrollbar;
-use gpui_kit::base::input::{AutoClosingPair, Backspace, Enter, set_language_config};
+use gpui_kit::base::input::{
+    AutoClosingPair, Backspace, EditorScrollbarContext, Enter, set_language_config,
+};
+use gpui_kit::base::{Scrollbar, ScrollbarHandle};
 use gpui_kit::component::input::language_config::LanguageConfig;
 use gpui_kit::component::input::{
     Editor, EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
@@ -11,9 +13,9 @@ use gpui_kit::component::{Sizable, Size};
 use gpui_kit::{
     Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
     HighlightStyle, Hitbox, HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Pixels, PlatformInput, ScrollDelta, ScrollEvent, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, div, ease_out_quint,
-    fill, point, px, rgb, size,
+    ParentElement, Pixels, PlatformInput, Point, ScrollDelta, ScrollEvent, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, Window, canvas, deferred, div,
+    ease_out_quint, fill, point, px, rgb, size,
 };
 
 use crate::markup::{self, Format};
@@ -72,8 +74,67 @@ pub fn register_language(cx: &mut App) {
     );
 }
 
-pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<EditorState> {
-    cx.new(|cx| {
+#[derive(Clone)]
+pub struct NoteEditor {
+    pub state: Entity<EditorState>,
+    inset: Rc<Cell<Pixels>>,
+}
+
+#[derive(Clone)]
+struct NoteScrollbar {
+    editor: EditorScrollbarContext,
+    inset: Rc<Cell<Pixels>>,
+    track: Bounds<Pixels>,
+}
+
+impl ScrollbarHandle for NoteScrollbar {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.track
+    }
+
+    fn content_size(&self) -> gpui_kit::Size<Pixels> {
+        let mut content = self.editor.content_size();
+        if content.height > self.track.size.height {
+            content.height += NOTE_MARGIN;
+        }
+        content
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        let mut offset = self.editor.offset();
+        offset.y = note_scroll_offset(offset.y, visible_inset(offset.y, &self.inset));
+        offset
+    }
+
+    fn set_offset(&self, mut offset: Point<Pixels>) {
+        // The track includes the inset before the first row, so its thumb
+        // continues toward the top while the editor itself is at offset zero.
+        self.inset.set(inset_at_scroll_offset(offset.y));
+        offset.y = (offset.y + NOTE_MARGIN).min(px(0.));
+        self.editor.set_offset(offset);
+    }
+}
+
+fn note_scroll_offset(editor_offset: Pixels, inset: Pixels) -> Pixels {
+    editor_offset + inset - NOTE_MARGIN
+}
+
+fn inset_at_scroll_offset(offset: Pixels) -> Pixels {
+    (offset + NOTE_MARGIN).clamp(px(0.), NOTE_MARGIN)
+}
+
+fn visible_inset(offset: Pixels, inset: &Cell<Pixels>) -> Pixels {
+    if offset < -SCROLL_EPSILON {
+        px(0.)
+    } else {
+        inset.get()
+    }
+}
+
+pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEditor {
+    let inset = Rc::new(Cell::new(NOTE_MARGIN));
+    let scrollbar_inset = inset.clone();
+    let state = cx.new(|cx| {
         let mut state = EditorState::new(window, cx)
             .default_value(initial.to_owned())
             .language(NOTE_LANGUAGE)
@@ -87,19 +148,27 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> Entity<
             // Leave room for the caret when the first-row inset shifts the editor down.
             .cursor_surrounding_lines(Some(2))
             .searchable(false);
-        state.set_scrollbar_renderer(Some(Rc::new(|viewport, _, _| {
-            Scrollbar::vertical(&viewport)
-                .styles(|styles| {
-                    styles
-                        .thumb(|thumb| thumb.width(px(3.)).inset(px(0.)))
-                        .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
-                        .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
-                })
-                .into_any_element()
+        state.set_scrollbar_renderer(Some(Rc::new(move |viewport, window, _| {
+            let mut track = viewport.viewport_bounds();
+            track.origin.y = window.visual_viewport_bounds().top();
+            let handle = NoteScrollbar {
+                editor: viewport,
+                inset: scrollbar_inset.clone(),
+                track,
+            };
+            let scrollbar = Scrollbar::vertical(&handle).styles(|styles| {
+                styles
+                    .thumb(|thumb| thumb.width(px(3.)).inset(px(0.)))
+                    .thumb_hover(|thumb| thumb.width(px(4.)).inset(px(0.)))
+                    .thumb_active(|thumb| thumb.width(px(4.)).inset(px(0.)))
+            });
+            // Draw outside the translated editor's clip with a window-fixed track.
+            deferred(scrollbar).into_any_element()
         })));
         state.set_highlighter_factory(Rc::new(|_| Some(Box::<NoteHighlighter>::default())), cx);
         state
-    })
+    });
+    NoteEditor { state, inset }
 }
 
 pub fn toggle_comment(state: &mut EditorState, window: &mut Window, cx: &mut Context<EditorState>) {
@@ -170,21 +239,14 @@ fn comment_edit(
     (replacement != source).then_some((range, replacement, adjusted))
 }
 
-pub fn paper(
-    state: &Entity<EditorState>,
-    direction: Option<isize>,
-    window: &mut Window,
-    cx: &mut App,
-) -> impl IntoElement {
-    let inset = window.use_keyed_state(("note-inset", state.entity_id()), cx, |_, _| {
-        Cell::new(NOTE_MARGIN)
-    });
-    let top_inset = if state.read(cx).scroll_offset().y < -SCROLL_EPSILON {
-        inset.read(cx).set(NOTE_MARGIN);
-        px(0.)
-    } else {
-        inset.read(cx).get()
-    };
+pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl IntoElement {
+    let state = &note.state;
+    let inset = note.inset.clone();
+    let offset = state.read(cx).scroll_offset().y;
+    if offset < -SCROLL_EPSILON {
+        inset.set(NOTE_MARGIN);
+    }
+    let top_inset = visible_inset(offset, &inset);
     let scroll_state = state.clone();
     let enter_state = state.clone();
     let backspace_state = state.clone();
@@ -280,7 +342,7 @@ pub fn paper(
 fn scroll_note(
     hitbox: Hitbox,
     editor: Entity<EditorState>,
-    inset: Entity<Cell<Pixels>>,
+    inset: Rc<Cell<Pixels>>,
     window: &mut Window,
 ) {
     let replaying = Rc::new(Cell::new(false));
@@ -305,21 +367,13 @@ fn scroll_note(
         // editor still handles the gesture phases, momentum and edge behavior.
         window.defer(cx, move |window, cx| {
             let offset = editor.read(cx).scroll_offset().y;
-            let old_inset = if offset < -SCROLL_EPSILON {
-                px(0.)
-            } else {
-                inset.read(cx).get()
-            };
+            let old_inset = visible_inset(offset, &inset);
             let travel = pixels.y * SCROLL_SPEED;
             // Scroll through the blank inset before scrolling text into the clip.
-            let inset_travel = if travel < px(0.) {
-                travel
-            } else {
-                (offset + travel).max(px(0.))
-            };
-            let new_inset = (old_inset + inset_travel).clamp(px(0.), NOTE_MARGIN);
+            let destination = note_scroll_offset(offset, old_inset) + travel;
+            let new_inset = inset_at_scroll_offset(destination);
             if new_inset != old_inset {
-                inset.read(cx).set(new_inset);
+                inset.set(new_inset);
                 window.refresh();
             }
             let remaining = travel - (new_inset - old_inset);

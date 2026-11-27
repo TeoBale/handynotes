@@ -177,12 +177,13 @@ impl Notebook {
                         self.editors.retain(|id, editor| {
                             self.store
                                 .get(*id)
-                                .is_some_and(|n| n.body == editor.read(cx).value().as_ref())
+                                .is_some_and(|n| n.body == editor.state.read(cx).value().as_ref())
                         });
                         if let Some(id) = self.current {
                             let note = self.store.get(id);
-                            if note.is_none_or(|n| n.body != self.editor.read(cx).value().as_ref())
-                            {
+                            if note.is_none_or(|n| {
+                                n.body != self.editor.state.read(cx).value().as_ref()
+                            }) {
                                 self.current = note.map(|n| n.id);
                                 self.editor = paper::editor_state(
                                     note.map_or("", |n| n.body.as_str()),
@@ -272,7 +273,7 @@ impl Notebook {
         if self.searching {
             w.focus(&self.query.focus_handle(cx), cx);
         } else {
-            w.focus(&self.editor.focus_handle(cx), cx);
+            w.focus(&self.editor.state.focus_handle(cx), cx);
         }
         cx.notify();
     }

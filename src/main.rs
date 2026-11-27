@@ -3,7 +3,7 @@ use gpui_kit::{
     self as kit,
     component::{
         Theme, ThemeMode,
-        input::{EditorState, Input, InputEvent, InputState},
+        input::{Input, InputEvent, InputState},
     },
     prelude::*,
     *,
@@ -27,11 +27,11 @@ struct DeletedNote {
 
 struct Notebook {
     account: account::Account,
-    editors: std::collections::HashMap<u64, Entity<EditorState>>,
+    editors: std::collections::HashMap<u64, paper::NoteEditor>,
     deletions: Vec<DeletedNote>,
     store: NoteStore,
     current: Option<u64>,
-    editor: Entity<EditorState>,
+    editor: paper::NoteEditor,
     query: Entity<InputState>,
     editor_events: Option<Subscription>,
     searching: bool,
@@ -125,7 +125,7 @@ impl Notebook {
 
     fn attach_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_events = Some(cx.subscribe_in(
-            &self.editor,
+            &self.editor.state,
             window,
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -134,11 +134,11 @@ impl Notebook {
                 }
             },
         ));
-        window.focus(&self.editor.focus_handle(cx), cx);
+        window.focus(&self.editor.state.focus_handle(cx), cx);
     }
 
     fn save(&mut self, cx: &mut Context<Self>) -> bool {
-        let body = self.editor.read(cx).value();
+        let body = self.editor.state.read(cx).value();
         let title = body
             .lines()
             .find(|l| !l.trim().is_empty())
@@ -172,7 +172,7 @@ impl Notebook {
     }
 
     fn can_create_note(&self, cx: &App) -> bool {
-        !self.editor.read(cx).value().trim().is_empty()
+        !self.editor.state.read(cx).value().trim().is_empty()
     }
 
     fn open(&mut self, id: Option<u64>, window: &mut Window, cx: &mut Context<Self>) {
@@ -198,7 +198,7 @@ impl Notebook {
             self.attach_editor(window, cx);
         }
         self.searching = false;
-        window.focus(&self.editor.focus_handle(cx), cx);
+        window.focus(&self.editor.state.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -260,10 +260,11 @@ impl Notebook {
                     && !k.modifiers.shift
                     && !k.modifiers.alt
                     && !k.modifiers.control
-                    && self.editor.focus_handle(cx).is_focused(w) =>
+                    && self.editor.state.focus_handle(cx).is_focused(w) =>
             {
                 if !e.is_held {
                     self.editor
+                        .state
                         .update(cx, |state, cx| paper::toggle_comment(state, w, cx));
                 }
             }
@@ -337,7 +338,10 @@ impl Notebook {
         if self.searching {
             (self.query.entity_id(), self.query.read(cx).value())
         } else {
-            (self.editor.entity_id(), self.editor.read(cx).value())
+            (
+                self.editor.state.entity_id(),
+                self.editor.state.read(cx).value(),
+            )
         }
     }
 
@@ -536,7 +540,7 @@ fn tool(
 }
 
 impl Render for Notebook {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut view = div()
             .size_full()
             .flex()
@@ -557,7 +561,7 @@ impl Render for Notebook {
             view.child(div().h(px(44.)).flex_shrink_0())
                 .child(self.browser(cx))
         } else {
-            view.child(paper::paper(&self.editor, self.slide_direction, window, cx))
+            view.child(paper::paper(&self.editor, self.slide_direction, cx))
         };
         if self.toolbar_visible && !self.account.visible {
             use kit::component::{Icon, IconName};
