@@ -1,7 +1,38 @@
 use std::ops::Range;
 
-use gpui_kit::component::input::{EditorState, RopeExt};
+use gpui_kit::component::input::{EditorState, Rope, RopeExt};
 use gpui_kit::{Context, EntityInputHandler, Window};
+
+pub(crate) fn line_ending(text: &Rope, row: usize) -> &'static str {
+    let Some(newline) = text.line_start_offset(row + 1).checked_sub(1) else {
+        return "\n";
+    };
+    let newline = if text.byte(newline) == b'\n' {
+        newline
+    } else if row > 0 {
+        text.line_start_offset(row) - 1
+    } else {
+        return "\n";
+    };
+    if newline > 0 && text.byte(newline - 1) == b'\r' {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+pub(crate) fn comment_offset(bytes: impl Iterator<Item = u8>) -> Option<usize> {
+    let mut bytes = bytes.enumerate().peekable();
+    // A whitespace boundary allows trailing comments without matching slashes in URLs.
+    let mut at_boundary = true;
+    while let Some((offset, byte)) = bytes.next() {
+        if at_boundary && byte == b'/' && matches!(bytes.peek(), Some((_, b'/'))) {
+            return Some(offset);
+        }
+        at_boundary = matches!(byte, b' ' | b'\t');
+    }
+    None
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TextEdit {
@@ -11,6 +42,17 @@ pub(crate) struct TextEdit {
 }
 
 impl TextEdit {
+    pub(crate) fn apply_atomic(
+        self,
+        state: &mut EditorState,
+        window: &mut Window,
+        cx: &mut Context<EditorState>,
+    ) {
+        state.set_selected_range(self.range, cx);
+        state.replace(self.replacement, window, cx);
+        state.set_selected_range(self.selection_after, cx);
+    }
+
     pub(crate) fn apply(
         self,
         state: &mut EditorState,

@@ -3,19 +3,22 @@ use gpui_kit::{
     self as kit,
     component::{
         Theme, ThemeMode,
-        input::{Input, InputEvent, InputState},
+        input::{Input, InputEditsEvent, InputEvent, InputState},
     },
     prelude::*,
     *,
 };
+use math_editing::HistoryDirection;
 use store::NoteStore;
 
 mod account;
 mod cloud;
 mod list_edit;
 mod markup;
+mod math_editing;
 mod native;
 mod note_edit;
+mod note_math;
 mod note_scroll;
 mod oauth;
 mod paper;
@@ -130,14 +133,76 @@ impl Notebook {
         self.editor_events = Some(cx.subscribe_in(
             &self.editor.state,
             window,
-            |this, _, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.save(cx);
-                    cx.notify();
+            |this, state, event: &InputEditsEvent, window, cx| {
+                let mut math = this.editor.math.borrow_mut();
+                if math.is_replaying() {
+                    return;
                 }
+                let editor = state.read(cx);
+                let edit = math.reconcile(editor.text(), event.edits(), editor.selected_range());
+                drop(math);
+                if let Some(edit) = edit {
+                    state.update(cx, |editor, cx| edit.apply_atomic(editor, window, cx));
+                }
+                this.save(cx);
+                cx.notify();
             },
         ));
         window.focus(&self.editor.state.focus_handle(cx), cx);
+    }
+
+    fn replay_math_history(
+        &mut self,
+        direction: HistoryDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.searching || self.account.visible {
+            return;
+        }
+        let editor = self.editor.clone();
+        let mut math = editor.math.borrow_mut();
+        if !math.begin_replay() {
+            return;
+        }
+        let before = editor.state.read(cx).text().clone();
+        drop(math);
+        // GPUI records a derived replacement separately from the input that caused it.
+        cx.defer_in(window, move |this, window, cx| {
+            let after = editor.state.read(cx).text().clone();
+            let companion_selection = editor
+                .math
+                .borrow()
+                .history_companion(&before, &after, direction);
+            if let Some(selection) = companion_selection {
+                let action: Box<dyn Action> = match direction {
+                    HistoryDirection::Undo => Box::new(kit::base::input::Undo),
+                    HistoryDirection::Redo => Box::new(kit::base::input::Redo),
+                };
+                window.dispatch_action(action, cx);
+                cx.defer_in(window, move |this, _, cx| {
+                    if direction == HistoryDirection::Redo {
+                        editor
+                            .state
+                            .update(cx, |state, cx| state.set_selected_range(selection, cx));
+                    }
+                    this.finish_math_history(editor, cx)
+                });
+            } else {
+                this.finish_math_history(editor, cx);
+            }
+        });
+    }
+
+    fn finish_math_history(&mut self, editor: paper::NoteEditor, cx: &mut Context<Self>) {
+        editor
+            .math
+            .borrow_mut()
+            .finish_replay(editor.state.read(cx).text().clone());
+        if self.editor.state == editor.state {
+            self.save(cx);
+            cx.notify();
+        }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) -> bool {
@@ -558,7 +623,12 @@ impl Render for Notebook {
                 if !this.account.visible && this.can_restore(cx) {
                     this.restore_note(window, cx);
                     cx.stop_propagation();
+                } else {
+                    this.replay_math_history(HistoryDirection::Undo, window, cx);
                 }
+            }))
+            .capture_action(cx.listener(|this, _: &kit::base::input::Redo, window, cx| {
+                this.replay_math_history(HistoryDirection::Redo, window, cx);
             }))
             .capture_key_down(cx.listener(Self::key));
         view = if self.account.visible {

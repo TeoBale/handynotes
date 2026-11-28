@@ -4,7 +4,7 @@ use gpui_kit::component::input::{Rope, RopeExt};
 use markdown::mdast::Node;
 
 use crate::markup;
-use crate::note_edit::TextEdit;
+use crate::note_edit::{TextEdit, line_ending};
 
 const MAX_LIST_NUMBER: u32 = 999_999_999;
 
@@ -12,7 +12,7 @@ const MAX_LIST_NUMBER: u32 = 999_999_999;
 pub(crate) struct FencedCode(Vec<Range<usize>>);
 
 impl FencedCode {
-    fn parse(text: &Rope) -> Self {
+    pub(crate) fn parse(text: &Rope) -> Self {
         if !text.bytes().any(|byte| matches!(byte, b'`' | b'~')) {
             return Self::default();
         }
@@ -42,7 +42,7 @@ impl FencedCode {
         Self(ranges)
     }
 
-    fn contains(&self, offset: usize) -> bool {
+    pub(crate) fn contains(&self, offset: usize) -> bool {
         let index = self.0.partition_point(|range| range.end <= offset);
         self.0
             .get(index)
@@ -124,22 +124,6 @@ pub(crate) fn list_edit(text: &Rope, cursor: usize, action: ListAction) -> Optio
         replacement,
         selection_after: caret..caret,
     })
-}
-
-fn line_ending(text: &Rope, row: usize) -> &'static str {
-    let newline = text.line_start_offset(row + 1) - 1;
-    let newline = if text.byte(newline) == b'\n' {
-        newline
-    } else if row > 0 {
-        text.line_start_offset(row) - 1
-    } else {
-        return "\n";
-    };
-    if newline > 0 && text.byte(newline - 1) == b'\r' {
-        "\r\n"
-    } else {
-        "\n"
-    }
 }
 
 fn indentation_width(bytes: impl Iterator<Item = u8>) -> usize {
