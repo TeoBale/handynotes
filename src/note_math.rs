@@ -12,6 +12,7 @@ use crate::note_edit::{TextEdit, comment_offset, line_ending};
 const EXCHANGE_RATES: &str = include_str!("../assets/ecb-reference-rates.txt");
 const MAX_EXPRESSION_BYTES: usize = 512;
 const MAX_EVALUATION_TIME: Duration = Duration::from_millis(25);
+const UNAVAILABLE_RESULT: &str = "n/a";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MathTrigger {
@@ -100,8 +101,11 @@ pub(crate) fn math_edit(
         }
     }
 
-    let result = statement.evaluate(&mut calculator, &deadline)?;
-    let answer = display_result(result, statement.expression, &mut calculator, &deadline);
+    let answer = match statement.evaluate(&mut calculator, &deadline) {
+        Some(result) => display_result(result, statement.expression, &mut calculator, &deadline),
+        None if statement.looks_like_calculation() => UNAVAILABLE_RESULT.to_owned(),
+        None => return None,
+    };
     let start = line_start + input.trim_end().len();
     let mut replacement = format!(" = {answer}");
     if trigger == MathTrigger::Return {
@@ -175,7 +179,8 @@ pub(crate) fn math_results(
         {
             let equals = start + input.len();
             let deadline = Deadline(Instant::now() + MAX_EVALUATION_TIME);
-            let result = Statement::parse(input).and_then(|statement| {
+            let statement = Statement::parse(input);
+            let result = statement.as_ref().and_then(|statement| {
                 let result = statement.evaluate(calculator, &deadline)?;
                 Some(display_result(
                     result,
@@ -184,14 +189,20 @@ pub(crate) fn math_results(
                     &deadline,
                 ))
             });
-            if result.is_some() || old_result.trim() == "?" || tracked_markers.contains(&equals) {
+            let old_result = old_result.trim();
+            if result.is_some()
+                || matches!(old_result, UNAVAILABLE_RESULT | "?")
+                || tracked_markers.contains(&equals)
+                || (old_result.is_empty()
+                    && statement.is_some_and(|statement| statement.looks_like_calculation()))
+            {
                 let suffix_start = input.trim_end().len();
                 let suffix_end = if code.len() == line.len() {
                     code.len()
                 } else {
                     code.trim_end().len()
                 };
-                let suffix = format!(" = {}", result.as_deref().unwrap_or("?"));
+                let suffix = format!(" = {}", result.as_deref().unwrap_or(UNAVAILABLE_RESULT));
                 let replacement = (code[suffix_start..suffix_end] != suffix).then_some(suffix);
                 results.push((
                     ResultSpan {
@@ -235,6 +246,15 @@ struct Statement<'a> {
 }
 
 impl<'a> Statement<'a> {
+    fn looks_like_calculation(&self) -> bool {
+        self.expression
+            .starts_with(|ch: char| ch.is_ascii_digit() || "(-+.$€£".contains(ch))
+            || self.expression.split_whitespace().any(|part| {
+                part.starts_with(|ch: char| ch.is_ascii_digit())
+                    || matches!(part, "+" | "-" | "*" | "/" | "^")
+            })
+    }
+
     fn parse(input: &'a str) -> Option<Self> {
         let (name, expression) = match input.split_once(':') {
             Some((name, expression)) => {
@@ -358,6 +378,12 @@ mod tests {
             ("log2 8", MathTrigger::Equals, "log2 8 = 3"),
             ("2 ^ (3 + 1) =", MathTrigger::Return, "2 ^ (3 + 1) = 16\n"),
             ("5 eur * 2", MathTrigger::Equals, "5 eur * 2 = 10€"),
+            (
+                "12 usd in eur * 3",
+                MathTrigger::Equals,
+                "12 usd in eur * 3 = n/a",
+            ),
+            ("1 / 0", MathTrigger::Equals, "1 / 0 = n/a"),
             ("5 km in m", MathTrigger::Return, "5 km in m = 5000 m\n"),
             (
                 "20 eur in usd",
@@ -382,9 +408,15 @@ mod tests {
             Some(format!("{note} = 31"))
         );
         let note = format!("{block}\n;\nmath:\nx + 2");
-        assert_eq!(press_at_end(&note, MathTrigger::Equals), None);
+        assert_eq!(
+            press_at_end(&note, MathTrigger::Equals),
+            Some(format!("{note} = n/a"))
+        );
         let note = format!("{block}\nmath:\nx + 2");
-        assert_eq!(press_at_end(&note, MathTrigger::Equals), None);
+        assert_eq!(
+            press_at_end(&note, MathTrigger::Equals),
+            Some(format!("{note} = n/a"))
+        );
     }
 
     #[test]
@@ -395,7 +427,6 @@ mod tests {
             "math:\n5 + 3 = 8;\nlog2 8",
             "math:\nFollow up with the team",
             "math:\n// 5 + 3",
-            "math:\n1 / 0",
             "math:\n```\n5 + 3",
             "```\nmath:\n```\n5 + 3",
         ] {

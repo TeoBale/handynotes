@@ -340,10 +340,24 @@ mod tests {
         let mut math = MathEditing::new(Rope::from(source));
         let offset = source.find('3').unwrap();
         let (text, selection) = input(&mut math, offset..offset + 1, "");
-        assert_eq!(text.to_string(), "math:\n5 + = ?");
+        assert_eq!(text.to_string(), "math:\n5 + = n/a");
         let caret = selection.start.min("math:\n5 +".len());
         let (text, _) = input(&mut math, caret..caret, " 4");
         assert_eq!(text.to_string(), "math:\n5 + 4 = 9");
+    }
+
+    #[test]
+    fn adds_unavailable_results_for_pasted_calculations_only_inside_math_blocks() {
+        let mut math = MathEditing::new(Rope::default());
+        let (text, _) = input(
+            &mut math,
+            0..0,
+            "math:\n12 usd in eur * 3 =\nFollow up =\n;\n1 / 0 =",
+        );
+        assert_eq!(
+            text.to_string(),
+            "math:\n12 usd in eur * 3 = n/a\nFollow up =\n;\n1 / 0 ="
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ hours + 2 = 28
 ;
 ```
 
-For conversions such as `5 km in m`, Return also inserts the result. Editing an expression updates its answer and any later calculations that use its variables. A temporarily invalid expression shows `?` until you fix it. Deleting any part of an answer removes the whole answer and its `=`. Press Return to continue on a new line after a result.
+For conversions such as `5 km in m`, Return also inserts the result. Editing an expression updates its answer and any later calculations that use its variables. Expressions that cannot be calculated show `n/a`. Deleting any part of an answer removes the whole answer and its `=`. Press Return to continue on a new line after a result.
 
 Calculations work offline. Currency conversions use the bundled ECB reference rates dated November 27, 2026. [ECB reference rates](https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html)
 
