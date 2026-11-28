@@ -8,16 +8,18 @@ use gpui_kit::component::input::{
 };
 use gpui_kit::component::{Sizable, Size};
 use gpui_kit::{
-    Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
-    HighlightStyle, HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Pixels, Point, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
-    UnderlineStyle, Window, canvas, combine_highlights, div, ease_out_quint, fill, font, point, px,
-    rgb, size,
+    Animation, AnimationExt, App, AppContext as _, Bounds, ClickEvent, Context, Entity,
+    EntityInputHandler, FontWeight, HighlightStyle, HitboxBehavior, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Pixels, Point, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, UnderlineStyle, Window, canvas,
+    combine_highlights, div, ease_out_quint, fill, font, point, px, rgb, size,
 };
 
 use crate::list_edit::{FencedCode, ListAction, ListKind, list_edit, list_line, scan_line};
 use crate::markup::{self, Format, WebLink};
-use crate::note_edit::TextEdit;
+use crate::math_editing::MathEditing;
+use crate::note_edit::{TextEdit, comment_offset};
+use crate::note_math::{MathTrigger, math_edit};
 use crate::note_scroll::{NOTE_MARGIN, NoteScroll};
 
 const NOTE_LANGUAGE: &str = "handynotes-markdown";
@@ -75,6 +77,7 @@ pub fn register_language(cx: &mut App) {
 #[derive(Clone)]
 pub struct NoteEditor {
     pub state: Entity<EditorState>,
+    pub(crate) math: Rc<RefCell<MathEditing>>,
     scroll: NoteScroll,
     links: Rc<RefCell<Vec<WebLink>>>,
     link_hover: TextDecorationCollection,
@@ -118,6 +121,7 @@ pub fn editor_state(initial: &str, window: &mut Window, cx: &mut App) -> NoteEdi
     });
     NoteEditor {
         state,
+        math: Rc::new(RefCell::new(MathEditing::new(Rope::from(initial)))),
         scroll,
         links,
         link_hover,
@@ -198,6 +202,7 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
     let backspace_state = state.clone();
     let click_state = state.clone();
     let key_state = state.clone();
+    let math = note.math.clone();
     let click_links = note.links.clone();
     let hover_links = note.links.clone();
     let hover_state = state.clone();
@@ -213,6 +218,10 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
         .pr(px(6.))
         .capture_action(move |action: &Enter, window, cx| {
             if !action.shift {
+                if !action.secondary && apply_math(&enter_state, MathTrigger::Return, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 let action = if action.secondary {
                     ListAction::ToggleCheckbox
                 } else {
@@ -261,6 +270,31 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
             }
         })
         .capture_key_down(move |event, window, cx| {
+            let stroke = &event.keystroke;
+            if !stroke.modifiers.platform
+                && !stroke.modifiers.control
+                && stroke
+                    .key_char
+                    .as_deref()
+                    .is_some_and(|key| key.chars().all(|ch| !ch.is_control()))
+                && math.borrow().blocks_typing(
+                    &key_state.read(cx).selected_range(),
+                    stroke.key_char.as_deref() == Some("="),
+                )
+            {
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
+            if stroke.key_char.as_deref() == Some("=")
+                && !stroke.modifiers.platform
+                && !stroke.modifiers.control
+                && apply_math(&key_state, MathTrigger::Equals, window, cx)
+            {
+                window.prevent_default();
+                cx.stop_propagation();
+                return;
+            }
             edit_selected_text(&key_state, event, window, cx)
         })
         .child(
@@ -323,6 +357,28 @@ pub fn paper(note: &NoteEditor, direction: Option<isize>, cx: &App) -> impl Into
             .inset_0(),
         )
         .child(editor)
+}
+
+fn apply_math(
+    editor: &Entity<EditorState>,
+    trigger: MathTrigger,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let state = editor.read(cx);
+    if !state.is_editable() {
+        return false;
+    }
+    let Some(edit) = math_edit(state.text(), state.selected_range(), trigger) else {
+        return false;
+    };
+    editor.update(cx, |state, cx| {
+        if state.marked_text_range(window, cx).is_some() {
+            return false;
+        }
+        edit.apply(state, window, cx);
+        true
+    })
 }
 
 fn clicked_link<'a>(
@@ -720,19 +776,6 @@ fn heading_level(chars: impl Iterator<Item = char>) -> Option<usize> {
     }
     ((1..=6).contains(&markers) && matches!(chars.next(), None | Some(' ' | '\t' | '\r')))
         .then_some(markers)
-}
-
-fn comment_offset(bytes: impl Iterator<Item = u8>) -> Option<usize> {
-    let mut bytes = bytes.enumerate().peekable();
-    // A whitespace boundary allows trailing comments without matching slashes in URLs.
-    let mut at_boundary = true;
-    while let Some((offset, byte)) = bytes.next() {
-        if at_boundary && byte == b'/' && matches!(bytes.peek(), Some((_, b'/'))) {
-            return Some(offset);
-        }
-        at_boundary = matches!(byte, b' ' | b'\t');
-    }
-    None
 }
 
 #[cfg(test)]

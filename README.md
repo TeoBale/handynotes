@@ -9,6 +9,26 @@ A small macOS scratchpad built with Rust, GPUI and GPUI Kit. While HandyNotes is
 
 Notes live in `~/Library/Application Support/HandyNotes/notes.json`. Blank drafts are saved only after typing. A shortcut conflict appears at the bottom of the window if another application owns Option–N.
 
+## Calculate in a note
+
+Write `math:` on its own line, then type `=` after an expression to insert its result. A semicolon ends the block. Plain text and `//` comments can sit between calculations.
+
+```text
+math:
+5 + 3 = 8
+log2 8 = 3
+hours: 5.2 * 5 = 26
+hours + 2 = 28
+5 km in m = 5000 m
+5 eur * 2 = 10€
+20 eur in usd = 21.91$
+;
+```
+
+For conversions such as `5 km in m`, Return also inserts the result. Editing an expression updates its answer and any later calculations that use its variables. A temporarily invalid expression shows `?` until you fix it. Deleting any part of an answer removes the whole answer and its `=`. Press Return to continue on a new line after a result.
+
+Calculations work offline. Currency conversions use the bundled ECB reference rates dated November 27, 2026. [ECB reference rates](https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html)
+
 ## Build on macOS
 
 With Rust and Xcode installed, run:
